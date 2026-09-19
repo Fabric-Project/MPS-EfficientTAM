@@ -39,9 +39,7 @@ public final class EfficientTAMMemoryEncoder
     private let maskLogitsTensor: MPSGraphTensor
     private let memoryFeaturesTensor: MPSGraphTensor
     private let executable: MPSGraphExecutable
-    private let slotSemaphore: DispatchSemaphore
-    private let slotLock = NSLock()
-    private var freeSlots: [Int]
+    private let slotPool: EfficientTAMSlotPool
     private let outputCaches: [OutputCache]
 
     private final class OutputCache
@@ -88,8 +86,7 @@ public final class EfficientTAMMemoryEncoder
             throw EfficientTAMError("EfficientTAM maxFramesInFlight must be positive.")
         }
         self.commandQueue = commandQueue
-        self.slotSemaphore = DispatchSemaphore(value: maxFramesInFlight)
-        self.freeSlots = Array(0..<maxFramesInFlight)
+        self.slotPool = EfficientTAMSlotPool(count: maxFramesInFlight)
         self.outputCaches = (0..<maxFramesInFlight).map { _ in OutputCache() }
 
         let weights = try EfficientTAMWeights(binaryURL: weightsBinaryURL, manifestURL: weightsManifestURL)
@@ -181,14 +178,17 @@ public final class EfficientTAMMemoryEncoder
                 completion(.failure(EfficientTAMError("EfficientTAM memory encoding produced no output tensor.")))
             }
         }
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(imageEmbeddingBuffer: imageEmbeddingBuffer, maskLogitsBuffer: maskLogitsBuffer),
-            results: nil,
-            executionDescriptor: descriptor
-        )
-        if commit { mpsCommandBuffer.commit() }
+        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(imageEmbeddingBuffer: imageEmbeddingBuffer, maskLogitsBuffer: maskLogitsBuffer),
+                results: nil,
+                executionDescriptor: descriptor
+            )
+            if commit { mpsCommandBuffer.commit() }
+        }
         return true
     }
 
@@ -208,7 +208,6 @@ public final class EfficientTAMMemoryEncoder
             commandBuffer: commandBuffer
         )
         guard let slot = self.acquireSlotNonBlocking() else { return false }
-        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         let output = MPSGraphTensorData(
             memoryFeaturesBuffer,
             shape: self.memoryFeaturesTensor.shape ?? [],
@@ -216,14 +215,26 @@ public final class EfficientTAMMemoryEncoder
         )
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(imageEmbeddingBuffer: imageEmbeddingBuffer, maskLogitsBuffer: maskLogitsBuffer),
-            results: [output],
-            executionDescriptor: descriptor
-        )
-        if commit { mpsCommandBuffer.commit() }
+        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
+        let mpsCommandBuffer = target.commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(imageEmbeddingBuffer: imageEmbeddingBuffer, maskLogitsBuffer: maskLogitsBuffer),
+                results: [output],
+                executionDescriptor: descriptor
+            )
+        }
+        do
+        {
+            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
+        }
+        catch
+        {
+            self.releaseSlot(slot)
+            throw error
+        }
         return true
     }
 
@@ -319,26 +330,17 @@ public final class EfficientTAMMemoryEncoder
 
     private func acquireSlotBlocking() -> Int
     {
-        self.slotSemaphore.wait()
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.acquire()
     }
 
     private func acquireSlotNonBlocking() -> Int?
     {
-        guard self.slotSemaphore.wait(timeout: .now()) == .success else { return nil }
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.tryAcquire()
     }
 
     private func releaseSlot(_ slot: Int)
     {
-        self.slotLock.lock()
-        self.freeSlots.append(slot)
-        self.slotLock.unlock()
-        self.slotSemaphore.signal()
+        self.slotPool.release(slot)
     }
 }
 

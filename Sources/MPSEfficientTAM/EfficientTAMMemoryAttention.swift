@@ -5,12 +5,17 @@ import MetalPerformanceShadersGraph
 
 /// Conditions a frame embedding on a fixed number of spatial memories and
 /// object pointers using EfficientTAM's four-layer RoPE memory transformer.
-/// Instances compile for exact memory and pointer counts, keeping execution
-/// shapes stable and allocation-free.
+/// By default an instance compiles for exact memory and pointer counts. With
+/// `usesKeyMask`, the counts are capacities: one compiled graph serves any
+/// number of valid memories and pointers up to them, with unused slots removed
+/// from attention by an additive key mask (see `makeKeyMaskBuffer`). Compiled
+/// graphs embed their own copy of the weights, so a single masked instance is
+/// far cheaper in memory than one exact instance per shape.
 public final class EfficientTAMMemoryAttention
 {
     public let memoryFrameCount: Int
     public let objectPointerCount: Int
+    public let usesKeyMask: Bool
 
     public var imageEmbeddingBufferLength: Int { 256 * 32 * 32 * MemoryLayout<Float>.stride }
     public var memoryFeaturesBufferLength: Int
@@ -30,13 +35,18 @@ public final class EfficientTAMMemoryAttention
     private let memoryTensor: MPSGraphTensor
     private let memoryPositionTensor: MPSGraphTensor
     private let objectPointersTensor: MPSGraphTensor?
+    private let keyMaskTensor: MPSGraphTensor?
     private let outputTensor: MPSGraphTensor
     private let executable: MPSGraphExecutable
-    private let slotSemaphore: DispatchSemaphore
-    private let slotLock = NSLock()
-    private var freeSlots: [Int]
+    private let slotPool: EfficientTAMSlotPool
     private let outputCaches: [OutputCache]
     private let temporalPositionEmbeddings: [Float]
+    private let feedOrder: [MPSGraphTensor]
+    /// The seven possible per-frame position blocks (spatial + temporal index
+    /// 0...6), each `[64, 32, 32]`, so a masked instance can assemble a frame's
+    /// position tensor with blits instead of CPU math. Nil unless `usesKeyMask`.
+    let positionBlocks: MTLBuffer?
+    static let positionBlockLength = 64 * 32 * 32 * MemoryLayout<Float>.stride
 
     private final class OutputCache
     {
@@ -46,6 +56,7 @@ public final class EfficientTAMMemoryAttention
     public convenience init(
         memoryFrameCount: Int,
         objectPointerCount: Int,
+        usesKeyMask: Bool = false,
         commandQueue: MTLCommandQueue,
         maxFramesInFlight: Int = 3
     ) throws
@@ -67,6 +78,7 @@ public final class EfficientTAMMemoryAttention
             weightsManifestURL: manifestURL,
             memoryFrameCount: memoryFrameCount,
             objectPointerCount: objectPointerCount,
+            usesKeyMask: usesKeyMask,
             commandQueue: commandQueue,
             maxFramesInFlight: maxFramesInFlight
         )
@@ -77,6 +89,7 @@ public final class EfficientTAMMemoryAttention
         weightsManifestURL: URL,
         memoryFrameCount: Int,
         objectPointerCount: Int,
+        usesKeyMask: Bool = false,
         commandQueue: MTLCommandQueue,
         maxFramesInFlight: Int = 3
     ) throws
@@ -91,13 +104,44 @@ public final class EfficientTAMMemoryAttention
         }
         self.memoryFrameCount = memoryFrameCount
         self.objectPointerCount = objectPointerCount
+        self.usesKeyMask = usesKeyMask
         self.commandQueue = commandQueue
-        self.slotSemaphore = DispatchSemaphore(value: maxFramesInFlight)
-        self.freeSlots = Array(0..<maxFramesInFlight)
+        self.slotPool = EfficientTAMSlotPool(count: maxFramesInFlight)
         self.outputCaches = (0..<maxFramesInFlight).map { _ in OutputCache() }
 
         let weights = try EfficientTAMWeights(binaryURL: weightsBinaryURL, manifestURL: weightsManifestURL)
-        self.temporalPositionEmbeddings = try weights.floats(named: "maskmem_tpos_enc")
+        let temporalEmbeddings = try weights.floats(named: "maskmem_tpos_enc")
+        self.temporalPositionEmbeddings = temporalEmbeddings
+        if usesKeyMask
+        {
+            let spatial = EfficientTAMMemoryEncoder.positionEmbedding()
+            let pixelCount = SelfMemoryShape.pixelCount
+            var blocks = [Float](repeating: 0, count: 7 * spatial.count)
+            for index in 0..<7
+            {
+                for channel in 0..<EfficientTAMMemoryEncoder.memoryChannels
+                {
+                    let temporal = temporalEmbeddings[index * EfficientTAMMemoryEncoder.memoryChannels + channel]
+                    for pixel in 0..<pixelCount
+                    {
+                        blocks[index * spatial.count + channel * pixelCount + pixel]
+                            = spatial[channel * pixelCount + pixel] + temporal
+                    }
+                }
+            }
+            guard let buffer = commandQueue.device.makeBuffer(
+                bytes: blocks,
+                length: blocks.count * MemoryLayout<Float>.stride
+            ) else
+            {
+                throw EfficientTAMError("Could not allocate the EfficientTAM position-block buffer.")
+            }
+            self.positionBlocks = buffer
+        }
+        else
+        {
+            self.positionBlocks = nil
+        }
         let image = self.graph.placeholder(shape: [1, 256, 32, 32], dataType: .float32, name: "image_embedding")
         let memory = self.graph.placeholder(
             shape: [1, memoryFrameCount as NSNumber, 64, 32, 32],
@@ -122,6 +166,20 @@ public final class EfficientTAMMemoryAttention
         {
             objectPointers = nil
         }
+        let keyMask: MPSGraphTensor?
+        if usesKeyMask
+        {
+            keyMask = self.graph.placeholder(
+                shape: [1, 1, (memoryFrameCount * 1024 + objectPointerCount * 4) as NSNumber],
+                dataType: .float32,
+                name: "key_mask"
+            )
+        }
+        else
+        {
+            keyMask = nil
+        }
+        self.keyMaskTensor = keyMask
         self.imageTensor = image
         self.memoryTensor = memory
         self.memoryPositionTensor = memoryPosition
@@ -136,7 +194,8 @@ public final class EfficientTAMMemoryAttention
             imageEmbedding: image,
             memoryFeatures: memory,
             memoryPosition: memoryPosition,
-            objectPointers: objectPointers
+            objectPointers: objectPointers,
+            keyMask: keyMask
         )
 
         let device = MPSGraphDevice(mtlDevice: commandQueue.device)
@@ -148,24 +207,34 @@ public final class EfficientTAMMemoryAttention
             memory: memoryType,
             memoryPosition: memoryPositionType,
         ]
-        var inputTypes = [imageType, memoryType, memoryPositionType]
         if let objectPointers
         {
-            let pointerType = MPSGraphShapedType(shape: objectPointers.shape ?? [], dataType: .float32)
-            feeds[objectPointers] = pointerType
-            inputTypes.append(pointerType)
+            feeds[objectPointers] = MPSGraphShapedType(shape: objectPointers.shape ?? [], dataType: .float32)
+        }
+        if let keyMask
+        {
+            feeds[keyMask] = MPSGraphShapedType(shape: keyMask.shape ?? [], dataType: .float32)
         }
         let descriptor = MPSGraphCompilationDescriptor()
         descriptor.optimizationLevel = .level1
         descriptor.waitForCompilationCompletion = true
-        self.executable = self.graph.compile(
+        let compiled = self.graph.compile(
             with: device,
             feeds: feeds,
             targetTensors: [self.outputTensor],
             targetOperations: nil,
             compilationDescriptor: descriptor
         )
-        self.executable.specialize(with: device, inputTypes: inputTypes, compilationDescriptor: descriptor)
+        // The executable defines its own feed order; follow it rather than
+        // assuming dictionary or declaration order.
+        let feedOrder = compiled.feedTensors ?? [image, memory, memoryPosition] + [objectPointers, keyMask].compactMap { $0 }
+        self.feedOrder = feedOrder
+        self.executable = compiled
+        compiled.specialize(
+            with: device,
+            inputTypes: feedOrder.compactMap { feeds[$0] },
+            compilationDescriptor: descriptor
+        )
     }
 
     /// Builds the spatial-plus-temporal position buffer for the memories in
@@ -173,7 +242,10 @@ public final class EfficientTAMMemoryAttention
     /// non-conditioning memories from newest to oldest.
     public func makeMemoryPositionBuffer(temporalPositionIndexes: [Int]) throws -> MTLBuffer
     {
-        guard temporalPositionIndexes.count == self.memoryFrameCount,
+        let validCount = self.usesKeyMask
+            ? (1...self.memoryFrameCount).contains(temporalPositionIndexes.count)
+            : temporalPositionIndexes.count == self.memoryFrameCount
+        guard validCount,
               temporalPositionIndexes.allSatisfy({ (0..<7).contains($0) }) else
         {
             throw EfficientTAMError("Memory temporal-position indexes must match the compiled frame count and be 0...6.")
@@ -181,7 +253,7 @@ public final class EfficientTAMMemoryAttention
         let spatial = EfficientTAMMemoryEncoder.positionEmbedding()
         let spatialPixelCount = SelfMemoryShape.pixelCount
         var values = [Float](repeating: 0, count: self.memoryFrameCount * spatial.count)
-        for frame in 0..<self.memoryFrameCount
+        for frame in 0..<temporalPositionIndexes.count
         {
             let temporalIndex = temporalPositionIndexes[frame]
             for channel in 0..<EfficientTAMMemoryEncoder.memoryChannels
@@ -207,18 +279,47 @@ public final class EfficientTAMMemoryAttention
         return buffer
     }
 
+    /// Builds the additive key mask for a `usesKeyMask` instance: zero for the
+    /// first `validMemoryFrameCount` memories and first `validPointerCount`
+    /// pointers, a large negative value for every unused slot. Valid memories
+    /// and pointers must be packed first in their buffers, and the unused tail
+    /// of each buffer must hold finite values (zeros).
+    public func makeKeyMaskBuffer(validMemoryFrameCount: Int, validPointerCount: Int) throws -> MTLBuffer
+    {
+        guard self.usesKeyMask,
+              (1...self.memoryFrameCount).contains(validMemoryFrameCount),
+              (0...self.objectPointerCount).contains(validPointerCount) else
+        {
+            throw EfficientTAMError("The key mask requires a key-mask instance and valid counts within its capacity.")
+        }
+        let spatialKeyCount = self.memoryFrameCount * 1024
+        var values = [Float](repeating: -1e9, count: spatialKeyCount + self.objectPointerCount * 4)
+        for index in 0..<(validMemoryFrameCount * 1024) { values[index] = 0 }
+        for index in 0..<(validPointerCount * 4) { values[spatialKeyCount + index] = 0 }
+        guard let buffer = self.commandQueue.device.makeBuffer(
+            bytes: values,
+            length: values.count * MemoryLayout<Float>.stride
+        ) else
+        {
+            throw EfficientTAMError("Could not allocate the EfficientTAM key-mask buffer.")
+        }
+        return buffer
+    }
+
     public func run(
         imageEmbeddingBuffer: MTLBuffer,
         memoryFeaturesBuffer: MTLBuffer,
         memoryPositionBuffer: MTLBuffer,
-        objectPointersBuffer: MTLBuffer? = nil
+        objectPointersBuffer: MTLBuffer? = nil,
+        keyMaskBuffer: MTLBuffer? = nil
     ) throws -> [Float]
     {
         try self.validate(
             imageEmbeddingBuffer: imageEmbeddingBuffer,
             memoryFeaturesBuffer: memoryFeaturesBuffer,
             memoryPositionBuffer: memoryPositionBuffer,
-            objectPointersBuffer: objectPointersBuffer
+            objectPointersBuffer: objectPointersBuffer,
+            keyMaskBuffer: keyMaskBuffer
         )
         let slot = self.acquireSlotBlocking()
         defer { self.releaseSlot(slot) }
@@ -228,7 +329,8 @@ public final class EfficientTAMMemoryAttention
                 imageEmbeddingBuffer: imageEmbeddingBuffer,
                 memoryFeaturesBuffer: memoryFeaturesBuffer,
                 memoryPositionBuffer: memoryPositionBuffer,
-                objectPointersBuffer: objectPointersBuffer
+                objectPointersBuffer: objectPointersBuffer,
+                keyMaskBuffer: keyMaskBuffer
             ),
             results: nil,
             executionDescriptor: nil
@@ -245,6 +347,7 @@ public final class EfficientTAMMemoryAttention
         memoryFeaturesBuffer: MTLBuffer,
         memoryPositionBuffer: MTLBuffer,
         objectPointersBuffer: MTLBuffer? = nil,
+        keyMaskBuffer: MTLBuffer? = nil,
         outputBuffer: MTLBuffer,
         commandBuffer: MTLCommandBuffer,
         commit: Bool
@@ -255,27 +358,40 @@ public final class EfficientTAMMemoryAttention
             memoryFeaturesBuffer: memoryFeaturesBuffer,
             memoryPositionBuffer: memoryPositionBuffer,
             objectPointersBuffer: objectPointersBuffer,
+            keyMaskBuffer: keyMaskBuffer,
             outputBuffer: outputBuffer,
             commandBuffer: commandBuffer
         )
         guard let slot = self.acquireSlotNonBlocking() else { return false }
-        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         let output = MPSGraphTensorData(outputBuffer, shape: self.outputTensor.shape ?? [], dataType: .float32)
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(
-                imageEmbeddingBuffer: imageEmbeddingBuffer,
-                memoryFeaturesBuffer: memoryFeaturesBuffer,
-                memoryPositionBuffer: memoryPositionBuffer,
-                objectPointersBuffer: objectPointersBuffer
-            ),
-            results: [output],
-            executionDescriptor: descriptor
-        )
-        if commit { mpsCommandBuffer.commit() }
+        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
+        let mpsCommandBuffer = target.commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(
+                    imageEmbeddingBuffer: imageEmbeddingBuffer,
+                    memoryFeaturesBuffer: memoryFeaturesBuffer,
+                    memoryPositionBuffer: memoryPositionBuffer,
+                    objectPointersBuffer: objectPointersBuffer,
+                    keyMaskBuffer: keyMaskBuffer
+                ),
+                results: [output],
+                executionDescriptor: descriptor
+            )
+        }
+        do
+        {
+            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
+        }
+        catch
+        {
+            self.releaseSlot(slot)
+            throw error
+        }
         return true
     }
 
@@ -283,29 +399,34 @@ public final class EfficientTAMMemoryAttention
         imageEmbeddingBuffer: MTLBuffer,
         memoryFeaturesBuffer: MTLBuffer,
         memoryPositionBuffer: MTLBuffer,
-        objectPointersBuffer: MTLBuffer?
+        objectPointersBuffer: MTLBuffer?,
+        keyMaskBuffer: MTLBuffer?
     ) -> [MPSGraphTensorData]
     {
-        var inputs = [
-            MPSGraphTensorData(imageEmbeddingBuffer, shape: self.imageTensor.shape ?? [], dataType: .float32),
-            MPSGraphTensorData(memoryFeaturesBuffer, shape: self.memoryTensor.shape ?? [], dataType: .float32),
-            MPSGraphTensorData(
-                memoryPositionBuffer,
-                shape: self.memoryPositionTensor.shape ?? [],
-                dataType: .float32
+        var data: [MPSGraphTensor: MPSGraphTensorData] = [
+            self.imageTensor: MPSGraphTensorData(
+                imageEmbeddingBuffer, shape: self.imageTensor.shape ?? [], dataType: .float32
+            ),
+            self.memoryTensor: MPSGraphTensorData(
+                memoryFeaturesBuffer, shape: self.memoryTensor.shape ?? [], dataType: .float32
+            ),
+            self.memoryPositionTensor: MPSGraphTensorData(
+                memoryPositionBuffer, shape: self.memoryPositionTensor.shape ?? [], dataType: .float32
             ),
         ]
         if let objectPointersTensor, let objectPointersBuffer
         {
-            inputs.append(
-                MPSGraphTensorData(
-                    objectPointersBuffer,
-                    shape: objectPointersTensor.shape ?? [],
-                    dataType: .float32
-                )
+            data[objectPointersTensor] = MPSGraphTensorData(
+                objectPointersBuffer, shape: objectPointersTensor.shape ?? [], dataType: .float32
             )
         }
-        return inputs
+        if let keyMaskTensor, let keyMaskBuffer
+        {
+            data[keyMaskTensor] = MPSGraphTensorData(
+                keyMaskBuffer, shape: keyMaskTensor.shape ?? [], dataType: .float32
+            )
+        }
+        return self.feedOrder.compactMap { data[$0] }
     }
 
     private func validate(
@@ -313,6 +434,7 @@ public final class EfficientTAMMemoryAttention
         memoryFeaturesBuffer: MTLBuffer,
         memoryPositionBuffer: MTLBuffer,
         objectPointersBuffer: MTLBuffer?,
+        keyMaskBuffer: MTLBuffer?,
         outputBuffer: MTLBuffer? = nil,
         commandBuffer: MTLCommandBuffer? = nil
     ) throws
@@ -337,6 +459,14 @@ public final class EfficientTAMMemoryAttention
                 throw EfficientTAMError("The object-pointers buffer is missing or too small.")
             }
         }
+        if self.usesKeyMask
+        {
+            let keyMaskLength = (self.memoryFrameCount * 1024 + self.objectPointerCount * 4) * MemoryLayout<Float>.stride
+            guard let keyMaskBuffer, keyMaskBuffer.length >= keyMaskLength else
+            {
+                throw EfficientTAMError("The key-mask buffer is missing or too small.")
+            }
+        }
         if let outputBuffer, outputBuffer.length < self.outputBufferLength
         {
             throw EfficientTAMError("The memory-attention output buffer is too small.")
@@ -359,26 +489,17 @@ public final class EfficientTAMMemoryAttention
 
     private func acquireSlotBlocking() -> Int
     {
-        self.slotSemaphore.wait()
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.acquire()
     }
 
     private func acquireSlotNonBlocking() -> Int?
     {
-        guard self.slotSemaphore.wait(timeout: .now()) == .success else { return nil }
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.tryAcquire()
     }
 
     private func releaseSlot(_ slot: Int)
     {
-        self.slotLock.lock()
-        self.freeSlots.append(slot)
-        self.slotLock.unlock()
-        self.slotSemaphore.signal()
+        self.slotPool.release(slot)
     }
 }
 
@@ -398,7 +519,8 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
         imageEmbedding: MPSGraphTensor,
         memoryFeatures: MPSGraphTensor,
         memoryPosition: MPSGraphTensor,
-        objectPointers: MPSGraphTensor?
+        objectPointers: MPSGraphTensor?,
+        keyMask: MPSGraphTensor?
     ) throws -> MPSGraphTensor
     {
         let noMemory = self.graph.reshape(
@@ -444,7 +566,8 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
                 value: normalized,
                 prefix: "\(prefix).self_attn",
                 spatialKeyRepeats: 1,
-                unrotatedKeyCount: 0
+                unrotatedKeyCount: 0,
+                keyMask: nil
             )
             current = self.graph.addition(current, selfAttention, name: nil)
 
@@ -456,7 +579,8 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
                 value: memory,
                 prefix: "\(prefix).cross_attn_image",
                 spatialKeyRepeats: self.memoryFrameCount,
-                unrotatedKeyCount: self.objectPointerCount * 4
+                unrotatedKeyCount: self.objectPointerCount * 4,
+                keyMask: keyMask
             )
             current = self.graph.addition(current, crossAttention, name: nil)
 
@@ -488,7 +612,8 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
         value: MPSGraphTensor,
         prefix: String,
         spatialKeyRepeats: Int,
-        unrotatedKeyCount: Int
+        unrotatedKeyCount: Int,
+        keyMask: MPSGraphTensor?
     ) throws -> MPSGraphTensor
     {
         var projectedQuery = try self.linear(query, prefix: "\(prefix).q_proj")
@@ -519,12 +644,19 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
         {
             projectedKey = rotatedSpatialKey
         }
-        let transposedKey = self.graph.transpose(projectedKey, permutation: [0, 2, 1], name: nil)
-        var scores = self.graph.matrixMultiplication(primary: projectedQuery, secondary: transposedKey, name: nil)
-        scores = self.graph.multiplication(scores, self.scalar(1 / sqrt(Float(256))), name: nil)
-        let probabilities = self.graph.softMax(with: scores, axis: 2, name: nil)
-        let attended = self.graph.matrixMultiplication(primary: probabilities, secondary: projectedValue, name: nil)
-        return try self.linear(attended, prefix: "\(prefix).out_proj")
+        let keyCount = (rotatedKeyCount + unrotatedKeyCount) as NSNumber
+        let attended = EfficientTAMAttentionOps.attention(
+            graph: self.graph,
+            query: self.graph.reshape(projectedQuery, shape: [1, 1, 1024, 256], name: nil),
+            key: self.graph.reshape(projectedKey, shape: [1, 1, keyCount, 256], name: nil),
+            value: self.graph.reshape(projectedValue, shape: [1, 1, keyCount, 256], name: nil),
+            mask: keyMask.map { self.graph.reshape($0, shape: [1, 1, 1, keyCount], name: nil) },
+            scale: 1 / sqrt(Float(256))
+        )
+        return try self.linear(
+            self.graph.reshape(attended, shape: [1, 1024, 256], name: nil),
+            prefix: "\(prefix).out_proj"
+        )
     }
 
     private func applyRoPE(_ input: MPSGraphTensor, repeats: Int) -> MPSGraphTensor

@@ -25,9 +25,7 @@ public final class EfficientTAMMaskSelector
     private let inputTensors: [MPSGraphTensor]
     private let outputTensors: [MPSGraphTensor]
     private let executable: MPSGraphExecutable
-    private let slotSemaphore: DispatchSemaphore
-    private let slotLock = NSLock()
-    private var freeSlots: [Int]
+    private let slotPool: EfficientTAMSlotPool
     private let caches: [OutputCache]
 
     private final class OutputCache
@@ -43,8 +41,7 @@ public final class EfficientTAMMaskSelector
             throw EfficientTAMError("EfficientTAM maxFramesInFlight must be positive.")
         }
         self.commandQueue = commandQueue
-        self.slotSemaphore = DispatchSemaphore(value: maxFramesInFlight)
-        self.freeSlots = Array(0..<maxFramesInFlight)
+        self.slotPool = EfficientTAMSlotPool(count: maxFramesInFlight)
         self.caches = (0..<maxFramesInFlight).map { _ in OutputCache() }
 
         let masks = self.graph.placeholder(shape: [1, 3, 128, 128], dataType: .float32, name: "mask_logits")
@@ -146,14 +143,17 @@ public final class EfficientTAMMaskSelector
             else if results.count == 3 { completion(.success(self.selection(from: results, slot: slot))) }
             else { completion(.failure(EfficientTAMError("EfficientTAM mask selection did not produce all outputs."))) }
         }
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(masks: maskLogitsBuffer, iou: iouPredictionsBuffer, pointers: objectPointersBuffer),
-            results: nil,
-            executionDescriptor: descriptor
-        )
-        if commit { mpsCommandBuffer.commit() }
+        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(masks: maskLogitsBuffer, iou: iouPredictionsBuffer, pointers: objectPointersBuffer),
+                results: nil,
+                executionDescriptor: descriptor
+            )
+            if commit { mpsCommandBuffer.commit() }
+        }
         return true
     }
 
@@ -179,21 +179,32 @@ public final class EfficientTAMMaskSelector
             commandBuffer: commandBuffer
         )
         guard let slot = self.acquireSlotNonBlocking() else { return false }
-        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         let outputs = zip(
             [selectedMaskLogitsBuffer, selectedIoUPredictionBuffer, selectedObjectPointerBuffer],
             self.outputTensors
         ).map { MPSGraphTensorData($0.0, shape: $0.1.shape ?? [], dataType: .float32) }
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(masks: maskLogitsBuffer, iou: iouPredictionsBuffer, pointers: objectPointersBuffer),
-            results: outputs,
-            executionDescriptor: descriptor
-        )
-        if commit { mpsCommandBuffer.commit() }
+        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
+        let mpsCommandBuffer = target.commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(masks: maskLogitsBuffer, iou: iouPredictionsBuffer, pointers: objectPointersBuffer),
+                results: outputs,
+                executionDescriptor: descriptor
+            )
+        }
+        do
+        {
+            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
+        }
+        catch
+        {
+            self.releaseSlot(slot)
+            throw error
+        }
         return true
     }
 
@@ -251,25 +262,16 @@ public final class EfficientTAMMaskSelector
 
     private func acquireSlotBlocking() -> Int
     {
-        self.slotSemaphore.wait()
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.acquire()
     }
 
     private func acquireSlotNonBlocking() -> Int?
     {
-        guard self.slotSemaphore.wait(timeout: .now()) == .success else { return nil }
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.tryAcquire()
     }
 
     private func releaseSlot(_ slot: Int)
     {
-        self.slotLock.lock()
-        self.freeSlots.append(slot)
-        self.slotLock.unlock()
-        self.slotSemaphore.signal()
+        self.slotPool.release(slot)
     }
 }

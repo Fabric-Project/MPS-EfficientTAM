@@ -33,9 +33,7 @@ public final class EfficientTAMImageEncoder
     private let inputTensor: MPSGraphTensor
     private let outputTensor: MPSGraphTensor
     private let executable: MPSGraphExecutable
-    private let slotSemaphore: DispatchSemaphore
-    private let slotLock = NSLock()
-    private var freeSlots: [Int]
+    private let slotPool: EfficientTAMSlotPool
     private let outputCaches: [OutputCache]
 
     private final class OutputCache
@@ -81,8 +79,7 @@ public final class EfficientTAMImageEncoder
         }
 
         self.commandQueue = commandQueue
-        self.slotSemaphore = DispatchSemaphore(value: maxFramesInFlight)
-        self.freeSlots = Array(0..<maxFramesInFlight)
+        self.slotPool = EfficientTAMSlotPool(count: maxFramesInFlight)
         self.outputCaches = (0..<maxFramesInFlight).map { _ in OutputCache() }
 
         let weights = try EfficientTAMWeights(binaryURL: weightsBinaryURL, manifestURL: weightsManifestURL)
@@ -175,16 +172,19 @@ public final class EfficientTAMImageEncoder
         }
 
         let inputData = MPSGraphTensorData(inputBuffer, shape: self.inputTensor.shape ?? [], dataType: .float32)
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: [inputData],
-            results: nil,
-            executionDescriptor: executionDescriptor
-        )
-        if commit
+        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
+        autoreleasepool
         {
-            mpsCommandBuffer.commit()
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: [inputData],
+                results: nil,
+                executionDescriptor: executionDescriptor
+            )
+            if commit
+            {
+                mpsCommandBuffer.commit()
+            }
         }
         return true
     }
@@ -208,23 +208,29 @@ public final class EfficientTAMImageEncoder
         }
         guard let slot = self.acquireSlotNonBlocking() else { return false }
 
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.releaseSlot(slot)
-        }
         let inputData = MPSGraphTensorData(inputBuffer, shape: self.inputTensor.shape ?? [], dataType: .float32)
         let outputData = MPSGraphTensorData(outputBuffer, shape: self.outputTensor.shape ?? [], dataType: .float32)
         let executionDescriptor = MPSGraphExecutableExecutionDescriptor()
         executionDescriptor.waitUntilCompleted = false
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: [inputData],
-            results: [outputData],
-            executionDescriptor: executionDescriptor
-        )
-        if commit
+        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
+        let mpsCommandBuffer = target.commandBuffer
+        autoreleasepool
         {
-            mpsCommandBuffer.commit()
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: [inputData],
+                results: [outputData],
+                executionDescriptor: executionDescriptor
+            )
+        }
+        do
+        {
+            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
+        }
+        catch
+        {
+            self.releaseSlot(slot)
+            throw error
         }
         return true
     }
@@ -262,26 +268,17 @@ public final class EfficientTAMImageEncoder
 
     private func acquireSlotBlocking() -> Int
     {
-        self.slotSemaphore.wait()
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.acquire()
     }
 
     private func acquireSlotNonBlocking() -> Int?
     {
-        guard self.slotSemaphore.wait(timeout: .now()) == .success else { return nil }
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.tryAcquire()
     }
 
     private func releaseSlot(_ slot: Int)
     {
-        self.slotLock.lock()
-        self.freeSlots.append(slot)
-        self.slotLock.unlock()
-        self.slotSemaphore.signal()
+        self.slotPool.release(slot)
     }
 
     private func floatArray(from tensorData: MPSGraphTensorData, slot: Int) -> [Float]
@@ -406,11 +403,14 @@ private struct EfficientTAMImageEncoderGraphBuilder
             shape: [batch as NSNumber, self.numberOfHeads as NSNumber, tokenCount as NSNumber, headDimension as NSNumber],
             name: nil
         )
-        let transposedKey = self.graph.transpose(key, permutation: [0, 1, 3, 2], name: nil)
-        var scores = self.graph.matrixMultiplication(primary: query, secondary: transposedKey, name: nil)
-        scores = self.graph.multiplication(scores, self.scalar(1 / sqrt(Float(headDimension))), name: nil)
-        let probabilities = self.graph.softMax(with: scores, axis: 3, name: nil)
-        var attended = self.graph.matrixMultiplication(primary: probabilities, secondary: value, name: nil)
+        var attended = EfficientTAMAttentionOps.attention(
+            graph: self.graph,
+            query: query,
+            key: key,
+            value: value,
+            mask: nil,
+            scale: 1 / sqrt(Float(headDimension))
+        )
         attended = self.graph.transpose(attended, permutation: [0, 2, 1, 3], name: nil)
         attended = self.graph.reshape(
             attended,

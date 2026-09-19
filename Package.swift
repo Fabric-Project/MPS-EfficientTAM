@@ -10,7 +10,10 @@ let package = Package(
     targets: [
         .target(
             name: "MPSEfficientTAM",
-            resources: [.copy("Models")]
+            resources: [
+                .copy("Models"),
+                .copy("Utils/Compute"),
+            ]
         ),
         .testTarget(
             name: "MPSEfficientTAMTests",

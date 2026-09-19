@@ -115,9 +115,7 @@ public final class EfficientTAMPromptDecoder
     private let objectScoreLogitTensor: MPSGraphTensor
     private let objectPointersTensor: MPSGraphTensor
     private let executable: MPSGraphExecutable
-    private let slotSemaphore: DispatchSemaphore
-    private let slotLock = NSLock()
-    private var freeSlots: [Int]
+    private let slotPool: EfficientTAMSlotPool
     private let outputCaches: [OutputCache]
     private let trackingOutputBuffers: [TrackingOutputBuffers]
 
@@ -180,8 +178,7 @@ public final class EfficientTAMPromptDecoder
 
         self.promptCount = promptCount
         self.commandQueue = commandQueue
-        self.slotSemaphore = DispatchSemaphore(value: maxFramesInFlight)
-        self.freeSlots = Array(0..<maxFramesInFlight)
+        self.slotPool = EfficientTAMSlotPool(count: maxFramesInFlight)
         self.outputCaches = (0..<maxFramesInFlight).map { _ in OutputCache() }
         var trackingOutputBuffers: [TrackingOutputBuffers] = []
         for _ in 0..<maxFramesInFlight
@@ -373,21 +370,24 @@ public final class EfficientTAMPromptDecoder
                 completion(.failure(EfficientTAMError("EfficientTAM prompt decoding did not produce both outputs.")))
             }
         }
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(
-                imageEmbeddingBuffer: imageEmbeddingBuffer,
-                promptCoordinatesBuffer: promptCoordinatesBuffer,
-                promptLabelsBuffer: promptLabelsBuffer,
-                densePromptEmbeddingBuffer: densePromptEmbeddingBuffer
-            ),
-            results: nil,
-            executionDescriptor: descriptor
-        )
-        if commit
+        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
+        autoreleasepool
         {
-            mpsCommandBuffer.commit()
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(
+                    imageEmbeddingBuffer: imageEmbeddingBuffer,
+                    promptCoordinatesBuffer: promptCoordinatesBuffer,
+                    promptLabelsBuffer: promptLabelsBuffer,
+                    densePromptEmbeddingBuffer: densePromptEmbeddingBuffer
+                ),
+                results: nil,
+                executionDescriptor: descriptor
+            )
+            if commit
+            {
+                mpsCommandBuffer.commit()
+            }
         }
         return true
     }
@@ -418,9 +418,6 @@ public final class EfficientTAMPromptDecoder
             commandBuffer: commandBuffer
         )
         guard let slot = self.acquireSlotNonBlocking() else { return false }
-        commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.releaseSlot(slot)
-        }
 
         let maskData = MPSGraphTensorData(
             maskLogitsBuffer,
@@ -445,21 +442,30 @@ public final class EfficientTAMPromptDecoder
         )
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(
-            to: mpsCommandBuffer,
-            inputs: self.inputs(
-                imageEmbeddingBuffer: imageEmbeddingBuffer,
-                promptCoordinatesBuffer: promptCoordinatesBuffer,
-                promptLabelsBuffer: promptLabelsBuffer,
-                densePromptEmbeddingBuffer: densePromptEmbeddingBuffer
-            ),
-            results: [maskData, iouData, objectScoreData, objectPointersData],
-            executionDescriptor: descriptor
-        )
-        if commit
+        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
+        let mpsCommandBuffer = target.commandBuffer
+        autoreleasepool
         {
-            mpsCommandBuffer.commit()
+            _ = self.executable.encode(
+                to: mpsCommandBuffer,
+                inputs: self.inputs(
+                    imageEmbeddingBuffer: imageEmbeddingBuffer,
+                    promptCoordinatesBuffer: promptCoordinatesBuffer,
+                    promptLabelsBuffer: promptLabelsBuffer,
+                    densePromptEmbeddingBuffer: densePromptEmbeddingBuffer
+                ),
+                results: [maskData, iouData, objectScoreData, objectPointersData],
+                executionDescriptor: descriptor
+            )
+        }
+        do
+        {
+            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
+        }
+        catch
+        {
+            self.releaseSlot(slot)
+            throw error
         }
         return true
     }
@@ -561,26 +567,17 @@ public final class EfficientTAMPromptDecoder
 
     private func acquireSlotBlocking() -> Int
     {
-        self.slotSemaphore.wait()
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.acquire()
     }
 
     private func acquireSlotNonBlocking() -> Int?
     {
-        guard self.slotSemaphore.wait(timeout: .now()) == .success else { return nil }
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.tryAcquire()
     }
 
     private func releaseSlot(_ slot: Int)
     {
-        self.slotLock.lock()
-        self.freeSlots.append(slot)
-        self.slotLock.unlock()
-        self.slotSemaphore.signal()
+        self.slotPool.release(slot)
     }
 
     private func prediction(from results: [MPSGraphTensorData], slot: Int) -> EfficientTAMMaskPrediction
@@ -928,11 +925,14 @@ private struct EfficientTAMPromptDecoderGraphBuilder
         projectedQuery = self.graph.transpose(projectedQuery, permutation: [0, 2, 1, 3], name: nil)
         projectedKey = self.graph.transpose(projectedKey, permutation: [0, 2, 1, 3], name: nil)
         projectedValue = self.graph.transpose(projectedValue, permutation: [0, 2, 1, 3], name: nil)
-        let transposedKey = self.graph.transpose(projectedKey, permutation: [0, 1, 3, 2], name: nil)
-        var scores = self.graph.matrixMultiplication(primary: projectedQuery, secondary: transposedKey, name: nil)
-        scores = self.graph.multiplication(scores, self.scalar(1 / sqrt(Float(headDimension))), name: nil)
-        let probabilities = self.graph.softMax(with: scores, axis: 3, name: nil)
-        var output = self.graph.matrixMultiplication(primary: probabilities, secondary: projectedValue, name: nil)
+        var output = EfficientTAMAttentionOps.attention(
+            graph: self.graph,
+            query: projectedQuery,
+            key: projectedKey,
+            value: projectedValue,
+            mask: nil,
+            scale: 1 / sqrt(Float(headDimension))
+        )
         output = self.graph.transpose(output, permutation: [0, 2, 1, 3], name: nil)
         output = self.graph.reshape(output, shape: [1, queryCount as NSNumber, internalDimension as NSNumber], name: nil)
         return try self.linear(output, prefix: "\(prefix).out_proj")

@@ -30,9 +30,7 @@ public final class EfficientTAMMaskPostprocessor
     private let inputTensor: MPSGraphTensor
     private let outputTensor: MPSGraphTensor
     private let executable: MPSGraphExecutable
-    private let slotSemaphore: DispatchSemaphore
-    private let slotLock = NSLock()
-    private var freeSlots: [Int]
+    private let slotPool: EfficientTAMSlotPool
     private let outputCaches: [OutputCache]
 
     private final class OutputCache
@@ -65,8 +63,7 @@ public final class EfficientTAMMaskPostprocessor
         self.outputWidth = outputWidth
         self.outputHeight = outputHeight
         self.commandQueue = commandQueue
-        self.slotSemaphore = DispatchSemaphore(value: maxFramesInFlight)
-        self.freeSlots = Array(0..<maxFramesInFlight)
+        self.slotPool = EfficientTAMSlotPool(count: maxFramesInFlight)
         self.outputCaches = (0..<maxFramesInFlight).map
         {
             _ in OutputCache(count: maskCount * outputWidth * outputHeight)
@@ -150,9 +147,12 @@ public final class EfficientTAMMaskPostprocessor
             }
         }
         let input = MPSGraphTensorData(maskLogitsBuffer, shape: self.inputTensor.shape ?? [], dataType: .float32)
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(to: mpsCommandBuffer, inputs: [input], results: nil, executionDescriptor: descriptor)
-        if commit { mpsCommandBuffer.commit() }
+        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(to: mpsCommandBuffer, inputs: [input], results: nil, executionDescriptor: descriptor)
+            if commit { mpsCommandBuffer.commit() }
+        }
         return true
     }
 
@@ -166,7 +166,6 @@ public final class EfficientTAMMaskPostprocessor
     {
         try self.validate(input: maskLogitsBuffer, output: resizedMaskLogitsBuffer, commandBuffer: commandBuffer)
         guard let slot = self.acquireSlotNonBlocking() else { return false }
-        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         let input = MPSGraphTensorData(maskLogitsBuffer, shape: self.inputTensor.shape ?? [], dataType: .float32)
         let output = MPSGraphTensorData(
             resizedMaskLogitsBuffer,
@@ -175,9 +174,21 @@ public final class EfficientTAMMaskPostprocessor
         )
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let mpsCommandBuffer = MPSCommandBuffer(commandBuffer: commandBuffer)
-        _ = self.executable.encode(to: mpsCommandBuffer, inputs: [input], results: [output], executionDescriptor: descriptor)
-        if commit { mpsCommandBuffer.commit() }
+        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
+        let mpsCommandBuffer = target.commandBuffer
+        autoreleasepool
+        {
+            _ = self.executable.encode(to: mpsCommandBuffer, inputs: [input], results: [output], executionDescriptor: descriptor)
+        }
+        do
+        {
+            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
+        }
+        catch
+        {
+            self.releaseSlot(slot)
+            throw error
+        }
         return true
     }
 
@@ -219,25 +230,16 @@ public final class EfficientTAMMaskPostprocessor
 
     private func acquireSlotBlocking() -> Int
     {
-        self.slotSemaphore.wait()
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.acquire()
     }
 
     private func acquireSlotNonBlocking() -> Int?
     {
-        guard self.slotSemaphore.wait(timeout: .now()) == .success else { return nil }
-        self.slotLock.lock()
-        defer { self.slotLock.unlock() }
-        return self.freeSlots.removeLast()
+        self.slotPool.tryAcquire()
     }
 
     private func releaseSlot(_ slot: Int)
     {
-        self.slotLock.lock()
-        self.freeSlots.append(slot)
-        self.slotLock.unlock()
-        self.slotSemaphore.signal()
+        self.slotPool.release(slot)
     }
 }

@@ -4,8 +4,10 @@ A Swift 5.9 package implementing EfficientTAM Tiny 512 image prompting
 directly with Metal Performance Shaders Graph.
 
 The package includes separate, composable GPU stages for image encoding,
-point/box decoding, iterative mask prompting, and official mask resizing. It
-is not yet a video tracker.
+point/box decoding, iterative mask prompting, official mask resizing, and the
+video memory path (memory encoder, memory attention, mask selection). A
+single-object, forward-only `EfficientTAMVideoTracker` composes them into a
+GPU-resident video tracker.
 
 ## Current scope
 
@@ -18,6 +20,10 @@ is not yet a video tracker.
   official learned mask-downscaling path.
 - Official bilinear resizing of raw mask logits to a caller-selected output
   size (`align_corners=false`), kept separate from decoding.
+- Video tracking: object-presence score, object pointers with the `no_obj_ptr`
+  substitution, `NO_OBJ_SCORE` mask suppression, the four-stage memory encoder,
+  and the four-layer RoPE memory attention over up to seven spatial memories
+  and sixteen object pointers.
 - Float32 transformer intermediates for accuracy. EfficientTAM's image encoder
   has known severe accuracy degradation when indiscriminately converted to
   FP16.
@@ -114,15 +120,88 @@ values in `0...1`. The model performs ImageNet normalization internally.
 array and therefore waits for GPU completion. Real-time consumers should use
 `encode` or `submit`.
 
+## Video tracking
+
+`EfficientTAMVideoTracker` tracks one object forward through a sequence from a
+prompted first frame. Every submission chains image encode, memory attention,
+tracking decode, best-IoU mask selection and memory encode on the caller's
+queue with no CPU/GPU wait, and returns GPU-resident buffers.
+
+```swift
+let tracker = try EfficientTAMVideoTracker(commandQueue: commandQueue, maxFramesInFlight: 3)
+try tracker.prewarmMemoryAttention()   // optional, avoids a first-use compile hitch
+
+// Inside a frame that already has an MPSCommandBuffer (for example Fabric's):
+// your own GPU work that produces `modelInput` is encoded first, then the tracker,
+// then whatever consumes its output. The frame's owner commits once.
+let first = try tracker.encodeInitialFrame(
+    inputBuffer: modelInput,
+    prompts: [
+        .init(x: 160, y: 300, label: .positivePoint),
+        .init(x: 0, y: 0, label: .padding),
+    ],
+    commandBuffer: frameCommandBuffer,
+    commit: false
+)
+
+// Later frames: returns nil (a dropped frame) when maxFramesInFlight are busy.
+if let output = try tracker.encodeNextFrame(inputBuffer: modelInput, commandBuffer: frameCommandBuffer, commit: false)
+{
+    // output.maskLogitsBuffer        [128, 128] raw logits, feed EfficientTAMMaskPostprocessor
+    // output.objectScoreLogitBuffer  object-presence logit; <= 0 means occluded/absent
+    // output.iouPredictionBuffer, output.objectPointerBuffer, output.memoryFeaturesBuffer
+}
+
+// Without a frame command buffer, the tracker uses its own queue and commits:
+// tracker.encodeInitialFrame(inputBuffer:prompts:) / tracker.encodeNextFrame(inputBuffer:)
+
+tracker.reset()   // start a new sequence
+```
+
+Notes:
+
+- The tracker keeps the conditioning frame plus the six most recent frames as
+  spatial memory, and the conditioning frame plus up to fifteen recent object
+  pointers, matching the official `track_step` selection.
+- Output buffers are private GPU memory, written by the command buffer the frame
+  was encoded onto. Work encoded after the tracker on that buffer, or committed
+  after it on the same queue, reads them with no wait; blit them to a shared
+  buffer if you need CPU access.
+- If you encode a frame and then abandon the uncommitted command buffer, call
+  `reset()`: the memory bank references buffers that were never written.
+- A dropped frame (`nil`) consumes no frame index, so temporal positions stay
+  correct across drops.
+- Memory attention is one compiled graph sized for the maximum (seven
+  memories, sixteen pointers), with an additive key mask removing unused slots
+  from attention, so it stays a single graph however many frames are tracked.
+  `prewarmMemoryAttention()` compiles it up front; otherwise it compiles on the
+  first `encodeNextFrame`.
+- Spatial memories are kept in float32. The official video predictor stores
+  them as bfloat16; this package deliberately does not.
+- Releasing the tracker or any stage while work is in flight is safe.
+
+Not yet supported: correction prompts on later frames, multiple conditioning
+frames, direct mask conditioning, reverse tracking, and multiple objects.
+
 ## Command-buffer ownership
 
-When `commit` is `true`, the package commits through its internal
-`MPSCommandBuffer` wrapper. Do not commit the raw command buffer again.
+Every stage's `encode(..., commandBuffer:, commit:)` takes any `MTLCommandBuffer`.
 
-When `commit` is `false`, the caller retains commit responsibility. MPSGraph
-may internally split a large executable across command buffers; consumers
-should treat the passed command buffer as dedicated to this inference call,
-consistent with the existing Fabric MPS modules.
+**Pass an `MPSCommandBuffer` when you have one** (Fabric's per-frame buffer is one).
+`MPSGraphExecutable.encode` may `commitAndContinue`, which commits the underlying
+Metal buffer and swaps a new one into the same `MPSCommandBuffer`. Stages encode
+onto the instance you pass and never wrap it again, so any number of stages, and
+your own blits and compute passes, can be encoded back to back onto one buffer
+with `commit: false`, and you commit that buffer once yourself. Completion
+handlers are registered on the live underlying buffer after encoding, so they
+fire when the last segment completes.
+
+**A plain `MTLCommandBuffer`** is wrapped for you, which is only safe when that
+call is also the one that commits it: use `commit: true`. Passing `commit: false`
+with a plain buffer throws if MPSGraph split the work, because the remainder
+would be stranded in a wrapper you cannot reach.
+
+Do not commit the raw buffer yourself in either case.
 
 ## Accuracy tests
 
@@ -132,7 +211,11 @@ swift test
 
 The differential tests compare all 262,144 image-embedding values, all 262,144
 dense mask-prompt values, complete multimask logits and IoU predictions, and
-a non-square resized-logit output to official PyTorch outputs. They also test
+a non-square resized-logit output to official PyTorch outputs. The video tests
+run the whole tracker over eleven real frames (including a fully occluded frame
+and the recovery after it, and every attention shape from one memory to seven
+memories with ten pointers) and compare each frame's mask, IoU, object score,
+pointer and new memory to the official `track_step`, at roughly 1e-5 error. They also test
 an entirely GPU-resident mask-prompt → decoder → postprocessor chain with no
 intervening CPU waits. Fixture generators live in `Tools`;
 `Tools/export_weights.py` recreates the native mapped-weight files from the
@@ -140,11 +223,13 @@ official checkpoint.
 
 ## Roadmap
 
-1. Video memory encoder and efficient memory attention.
-2. Stateful video tracking with explicit reset and bounded frames in flight.
+1. Correction prompts on later frames and multiple conditioning frames
+   (needs the decoder's single-mask token mode for multi-point frames).
+2. Direct mask conditioning, reverse tracking, and multi-object state with an
+   optional non-overlap stage.
 
-Fabric node integration should still wait until the image API is exercised in
-the package and its buffer-lifetime contract is stable.
+Fabric node integration should wait until the tracker's buffer-lifetime and
+backpressure contract has been exercised in the package.
 
 ## Upstream
 
