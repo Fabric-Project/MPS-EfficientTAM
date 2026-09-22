@@ -117,6 +117,62 @@ private let frameHeight = 512
     try verifyTrackerOutputs(outputs, device: device, commandQueue: commandQueue)
 }
 
+/// Two trackers on one device share their stateless stages (encoder, decoder,
+/// selector, memory encoder, attention) and each keeps its own memory bank.
+/// Interleaving their frames on the same shared stages must leave BOTH matching
+/// the official reference, frame for frame. That is the re-entrancy guarantee:
+/// a shared stage keeps no per-tracker state, and its in-flight capacity covers
+/// both trackers at once.
+@Test func twoTrackersSharingStagesBothMatchOfficialPyTorch() throws
+{
+    guard let device = MTLCreateSystemDefaultDevice(),
+          let commandQueue = device.makeCommandQueue() else
+    {
+        return
+    }
+    let first = try EfficientTAMVideoTracker(commandQueue: commandQueue, maxFramesInFlight: 3)
+    let second = try EfficientTAMVideoTracker(commandQueue: commandQueue, maxFramesInFlight: 3)
+    #expect(first.sharedStagesIdentifier == second.sharedStagesIdentifier, "trackers on one device must share their stages")
+
+    let frames = try trackerFixtureBytes(named: "tracker_frames_rgb_uint8")
+    let frameLength = frameWidth * frameHeight * 3
+    let inputBuffers: [MTLBuffer] = try (0..<frameCount).map
+    {
+        index in
+        let rgb = frames[(index * frameLength)..<((index + 1) * frameLength)].map { Float($0) / 255 }
+        return try #require(device.makeBuffer(bytes: rgb, length: rgb.count * MemoryLayout<Float>.stride))
+    }
+    let prompts: [EfficientTAMPrompt] = [
+        .init(x: 160, y: 300, label: .positivePoint),
+        .init(x: 0, y: 0, label: .padding),
+    ]
+
+    // A tracker returns nil while its own frames are in flight, and its slot
+    // returns from a completion handler, so retry briefly.
+    func submit(_ tracker: EfficientTAMVideoTracker, frame: Int) throws -> EfficientTAMVideoTrackingOutput
+    {
+        for _ in 0..<2000
+        {
+            let output = frame == 0
+                ? try tracker.encodeInitialFrame(inputBuffer: inputBuffers[0], prompts: prompts)
+                : try tracker.encodeNextFrame(inputBuffer: inputBuffers[frame])
+            if let output { return output }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        throw EfficientTAMError("Tracker never accepted frame \(frame).")
+    }
+
+    var firstOutputs: [EfficientTAMVideoTrackingOutput] = []
+    var secondOutputs: [EfficientTAMVideoTrackingOutput] = []
+    for index in 0..<frameCount
+    {
+        firstOutputs.append(try submit(first, frame: index))
+        secondOutputs.append(try submit(second, frame: index))
+    }
+    try verifyTrackerOutputs(firstOutputs, device: device, commandQueue: commandQueue)
+    try verifyTrackerOutputs(secondOutputs, device: device, commandQueue: commandQueue)
+}
+
 /// Reads every output back with one blit pass and one wait (test-only), and
 /// compares each frame to the upstream `track_step` reference.
 private func verifyTrackerOutputs(

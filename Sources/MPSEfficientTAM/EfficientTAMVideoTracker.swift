@@ -33,24 +33,35 @@ public struct EfficientTAMVideoTrackingOutput
 public final class EfficientTAMVideoTracker
 {
     public let initialPromptCount: Int
-    public let maximumSpatialMemoryCount = 7
-    public let maximumObjectPointerCount = 16
+    public let maximumSpatialMemoryCount = EfficientTAMVideoTracker.maximumSpatialMemoryCount
+    public let maximumObjectPointerCount = EfficientTAMVideoTracker.maximumObjectPointerCount
+
+    static let maximumSpatialMemoryCount = 7
+    static let maximumObjectPointerCount = 16
 
     private let commandQueue: MTLCommandQueue
+
+    /// The stateless stages, shared with every other tracker on this device. The
+    /// properties below are views of it (and, for a non-default
+    /// `initialPromptCount`, the initial decoder is this tracker's own).
+    private let stages: EfficientTAMSharedStages
     private let imageEncoder: EfficientTAMImageEncoder
     private let initialDecoder: EfficientTAMPromptDecoder
     private let trackingDecoder: EfficientTAMPromptDecoder
     private let maskSelector: EfficientTAMMaskSelector
     private let memoryEncoder: EfficientTAMMemoryEncoder
+
     private let trackingPromptCoordinatesBuffer: MTLBuffer
     private let trackingPromptLabelsBuffer: MTLBuffer
-    private let stageSlotCount: Int
     private let submissionSlots: EfficientTAMSlotPool
     private let stateLock = NSLock()
     private var memoryEntries: [MemoryEntry] = []
     private var nextFrameIndex = 0
-    private var maskedAttention: EfficientTAMMemoryAttention?
     private var keyMaskCache: [AttentionShape: MTLBuffer] = [:]
+
+    /// Identifies the shared stage container, so tests can check that trackers
+    /// on one device really share it.
+    var sharedStagesIdentifier: ObjectIdentifier { ObjectIdentifier(self.stages) }
 
     /// Test/benchmark hook: CPU milliseconds spent inside each part of an encode.
     var cpuTimingHandler: ((_ frameIndex: Int, _ stage: String, _ milliseconds: Double) -> Void)?
@@ -87,36 +98,30 @@ public final class EfficientTAMVideoTracker
         }
         self.initialPromptCount = initialPromptCount
         self.commandQueue = commandQueue
-        // The tracker's slot pool is the only admission control; its stages are
-        // private, so their own slot pools must never reject a frame the
-        // tracker has admitted. A stage releases its slot from a completion
-        // handler that can lag the tracker's own release by a callback hop, so
-        // the stages get headroom rather than an exact match.
-        let stageSlotCount = maxFramesInFlight * 2
-        self.stageSlotCount = stageSlotCount
+        // This tracker's own admission control. The stages are shared, so their
+        // slots are sized for many trackers and never reject a frame this
+        // tracker has admitted unless more trackers are in flight at once than
+        // `EfficientTAMSharedStages.framesInFlight` allows.
         self.submissionSlots = EfficientTAMSlotPool(count: maxFramesInFlight)
-        self.imageEncoder = try EfficientTAMImageEncoder(
-            commandQueue: commandQueue,
-            maxFramesInFlight: stageSlotCount
-        )
-        self.initialDecoder = try EfficientTAMPromptDecoder(
-            promptCount: initialPromptCount,
-            commandQueue: commandQueue,
-            maxFramesInFlight: stageSlotCount
-        )
-        self.trackingDecoder = try EfficientTAMPromptDecoder(
-            promptCount: 2,
-            commandQueue: commandQueue,
-            maxFramesInFlight: stageSlotCount
-        )
-        self.maskSelector = try EfficientTAMMaskSelector(
-            commandQueue: commandQueue,
-            maxFramesInFlight: stageSlotCount
-        )
-        self.memoryEncoder = try EfficientTAMMemoryEncoder(
-            commandQueue: commandQueue,
-            maxFramesInFlight: stageSlotCount
-        )
+
+        let stages = try EfficientTAMSharedStages.stages(commandQueue: commandQueue)
+        self.stages = stages
+        self.imageEncoder = stages.imageEncoder
+        self.trackingDecoder = stages.promptDecoder
+        self.maskSelector = stages.maskSelector
+        self.memoryEncoder = stages.memoryEncoder
+        if initialPromptCount == EfficientTAMSharedStages.promptTokenCount
+        {
+            self.initialDecoder = stages.promptDecoder
+        }
+        else
+        {
+            self.initialDecoder = try EfficientTAMPromptDecoder(
+                promptCount: initialPromptCount,
+                commandQueue: commandQueue,
+                maxFramesInFlight: maxFramesInFlight * 2
+            )
+        }
         let trackingPrompts = try self.trackingDecoder.makePromptBuffers([
             EfficientTAMPrompt(x: 0, y: 0, label: .padding),
             EfficientTAMPrompt(x: 0, y: 0, label: .padding),
@@ -552,18 +557,7 @@ public final class EfficientTAMVideoTracker
 
     private func memoryAttention() throws -> EfficientTAMMemoryAttention
     {
-        self.stateLock.lock()
-        defer { self.stateLock.unlock() }
-        if let maskedAttention = self.maskedAttention { return maskedAttention }
-        let attention = try EfficientTAMMemoryAttention(
-            memoryFrameCount: self.maximumSpatialMemoryCount,
-            objectPointerCount: self.maximumObjectPointerCount,
-            usesKeyMask: true,
-            commandQueue: self.commandQueue,
-            maxFramesInFlight: self.stageSlotCount
-        )
-        self.maskedAttention = attention
-        return attention
+        try self.stages.maskedMemoryAttention()
     }
 
     private func keyMask(
