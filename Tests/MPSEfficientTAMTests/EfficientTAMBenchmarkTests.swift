@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders
 import QuartzCore
 import Testing
 @testable import MPSEfficientTAM
@@ -139,13 +140,15 @@ func memoryLeakProbe() throws
             var done = 0
             while done < count
             {
-                guard let out = output(), let commandBuffer = queue.makeCommandBuffer() else { break }
-                if try encoder.encode(
+                guard let out = output() else { break }
+                let commandBuffer = MPSCommandBuffer(from: queue)
+                let accepted = try encoder.encode(
                     inputBuffer: inputBuffers[done % inputBuffers.count],
                     outputBuffer: out,
-                    commandBuffer: commandBuffer,
-                    commit: true
+                    commandBuffer: commandBuffer
                 )
+                commandBuffer.commit()
+                if accepted
                 {
                     done += 1
                 }
@@ -177,8 +180,10 @@ func memoryLeakProbe() throws
             var done = 0
             while done < 100
             {
-                guard let commandBuffer = commandQueue.makeCommandBuffer() else { break }
-                if try encoder.submit(inputBuffer: inputBuffers[done % 4], commandBuffer: commandBuffer, commit: true, completion: { _ in })
+                let commandBuffer = MPSCommandBuffer(from: commandQueue)
+                let accepted = try encoder.submit(inputBuffer: inputBuffers[done % 4], commandBuffer: commandBuffer, completion: { _ in })
+                commandBuffer.commit()
+                if accepted
                 {
                     done += 1
                 }

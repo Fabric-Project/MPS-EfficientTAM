@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders
 import Testing
 @testable import MPSEfficientTAM
 
@@ -50,16 +51,16 @@ import Testing
     ), let densePromptBuffer = device.makeBuffer(
         length: maskPromptEncoder.outputBufferLength,
         options: .storageModeShared
-    ), let commandBuffer = commandQueue.makeCommandBuffer() else
+    ), let commandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)) else
     {
         return
     }
     let accepted = try maskPromptEncoder.encode(
         maskLogitsBuffer: priorMaskBuffer,
         densePromptEmbeddingBuffer: densePromptBuffer,
-        commandBuffer: commandBuffer,
-        commit: true
+        commandBuffer: commandBuffer
     )
+    commandBuffer.commit()
     #expect(accepted)
     commandBuffer.waitUntilCompleted()
 
@@ -123,9 +124,9 @@ import Testing
 {
     guard let device = MTLCreateSystemDefaultDevice(),
           let commandQueue = device.makeCommandQueue(),
-          let maskPromptCommandBuffer = commandQueue.makeCommandBuffer(),
-          let decoderCommandBuffer = commandQueue.makeCommandBuffer(),
-          let postprocessCommandBuffer = commandQueue.makeCommandBuffer(),
+          let maskPromptCommandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)),
+          let decoderCommandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)),
+          let postprocessCommandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)),
           let verificationCommandBuffer = commandQueue.makeCommandBuffer() else
     {
         return
@@ -173,9 +174,9 @@ import Testing
     #expect(try maskPromptEncoder.encode(
         maskLogitsBuffer: priorMaskBuffer,
         densePromptEmbeddingBuffer: densePromptBuffer,
-        commandBuffer: maskPromptCommandBuffer,
-        commit: true
+        commandBuffer: maskPromptCommandBuffer
     ))
+    maskPromptCommandBuffer.commit()
     #expect(try decoder.encode(
         imageEmbeddingBuffer: imageEmbeddingBuffer,
         promptCoordinatesBuffer: promptBuffers.coordinates,
@@ -183,15 +184,15 @@ import Testing
         densePromptEmbeddingBuffer: densePromptBuffer,
         maskLogitsBuffer: maskBuffer,
         iouPredictionsBuffer: iouBuffer,
-        commandBuffer: decoderCommandBuffer,
-        commit: true
+        commandBuffer: decoderCommandBuffer
     ))
+    decoderCommandBuffer.commit()
     #expect(try postprocessor.encode(
         maskLogitsBuffer: maskBuffer,
         resizedMaskLogitsBuffer: resizedBuffer,
-        commandBuffer: postprocessCommandBuffer,
-        commit: true
+        commandBuffer: postprocessCommandBuffer
     ))
+    postprocessCommandBuffer.commit()
 
     guard let blit = verificationCommandBuffer.makeBlitCommandEncoder() else { return }
     blit.copy(

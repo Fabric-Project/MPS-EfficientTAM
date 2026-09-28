@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders
 import Testing
 @testable import MPSEfficientTAM
 
@@ -56,7 +57,7 @@ import Testing
 {
     guard let device = MTLCreateSystemDefaultDevice(),
           let commandQueue = device.makeCommandQueue(),
-          let modelCommandBuffer = commandQueue.makeCommandBuffer(),
+          let modelCommandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)),
           let verificationCommandBuffer = commandQueue.makeCommandBuffer(),
           let blit = verificationCommandBuffer.makeBlitCommandEncoder(),
           let inputBuffer = device.makeBuffer(
@@ -75,9 +76,9 @@ import Testing
     let accepted = try encoder.encode(
         inputBuffer: inputBuffer,
         outputBuffer: outputBuffer,
-        commandBuffer: modelCommandBuffer,
-        commit: true
+        commandBuffer: modelCommandBuffer
     )
+    modelCommandBuffer.commit()
     #expect(accepted)
     blit.copy(from: outputBuffer, sourceOffset: 0, to: stagingBuffer, destinationOffset: 0, size: encoder.outputBufferLength)
     blit.endEncoding()

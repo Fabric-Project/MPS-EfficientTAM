@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders
 import Testing
 @testable import MPSEfficientTAM
 
@@ -105,8 +106,8 @@ import Testing
 {
     guard let device = MTLCreateSystemDefaultDevice(),
           let commandQueue = device.makeCommandQueue(),
-          let encoderCommandBuffer = commandQueue.makeCommandBuffer(),
-          let decoderCommandBuffer = commandQueue.makeCommandBuffer(),
+          let encoderCommandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)),
+          let decoderCommandBuffer = commandQueue.makeCommandBuffer().map(MPSCommandBuffer.init(commandBuffer:)),
           let verificationCommandBuffer = commandQueue.makeCommandBuffer() else
     {
         return
@@ -145,18 +146,18 @@ import Testing
     let encoderAccepted = try encoder.encode(
         inputBuffer: inputBuffer,
         outputBuffer: embeddingBuffer,
-        commandBuffer: encoderCommandBuffer,
-        commit: true
+        commandBuffer: encoderCommandBuffer
     )
+    encoderCommandBuffer.commit()
     let decoderAccepted = try decoder.encode(
         imageEmbeddingBuffer: embeddingBuffer,
         promptCoordinatesBuffer: promptBuffers.coordinates,
         promptLabelsBuffer: promptBuffers.labels,
         maskLogitsBuffer: maskBuffer,
         iouPredictionsBuffer: iouBuffer,
-        commandBuffer: decoderCommandBuffer,
-        commit: true
+        commandBuffer: decoderCommandBuffer
     )
+    decoderCommandBuffer.commit()
     #expect(encoderAccepted)
     #expect(decoderAccepted)
 

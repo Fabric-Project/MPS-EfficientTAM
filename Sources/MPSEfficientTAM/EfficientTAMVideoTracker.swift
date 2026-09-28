@@ -23,9 +23,9 @@ public struct EfficientTAMVideoTrackingOutput
 /// Every stage of a frame (image encode, memory attention, decode, mask
 /// selection, memory encode, and the memory-bank assembly blit) is encoded back
 /// to back onto one command buffer. Pass Fabric's per-frame `MPSCommandBuffer`
-/// with `commit: false` to make the whole frame part of it; the tracker never
-/// commits or waits on a buffer it does not own. The overloads without a
-/// command buffer use the tracker's own queue and commit.
+/// to make the whole frame part of it; the tracker never commits or waits on a
+/// buffer it does not own -- the caller commits it. The overloads without a
+/// command buffer create and commit their own, on the tracker's queue.
 ///
 /// The tracker's memory bank references buffers written by frames already
 /// encoded. If a caller encodes a frame and then abandons the uncommitted
@@ -144,13 +144,12 @@ public final class EfficientTAMVideoTracker
 
     /// Starts tracking from a prompted conditioning frame, encoded onto
     /// `commandBuffer`. Returns nil under in-flight backpressure instead of
-    /// blocking. With `commit: false` the caller commits the buffer; the
-    /// tracker's in-flight slot is returned when that buffer completes.
+    /// blocking. The caller commits the buffer; the tracker's in-flight slot
+    /// is returned when that buffer completes.
     public func encodeInitialFrame(
         inputBuffer: MTLBuffer,
         prompts: [EfficientTAMPrompt],
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
         let promptBuffers = try self.initialDecoder.makePromptBuffers(prompts)
@@ -158,8 +157,7 @@ public final class EfficientTAMVideoTracker
             inputBuffer: inputBuffer,
             promptCoordinatesBuffer: promptBuffers.coordinates,
             promptLabelsBuffer: promptBuffers.labels,
-            commandBuffer: commandBuffer,
-            commit: commit
+            commandBuffer: commandBuffer
         )
     }
 
@@ -167,15 +165,13 @@ public final class EfficientTAMVideoTracker
         inputBuffer: MTLBuffer,
         promptCoordinatesBuffer: MTLBuffer,
         promptLabelsBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
         try self.encodeFrame(
             kind: .initial(promptCoordinates: promptCoordinatesBuffer, promptLabels: promptLabelsBuffer),
             inputBuffer: inputBuffer,
-            commandBuffer: commandBuffer,
-            commit: commit
+            commandBuffer: commandBuffer
         )
     }
 
@@ -184,11 +180,10 @@ public final class EfficientTAMVideoTracker
     /// no wait occurs.
     public func encodeNextFrame(
         inputBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
-        try self.encodeFrame(kind: .tracking, inputBuffer: inputBuffer, commandBuffer: commandBuffer, commit: commit)
+        try self.encodeFrame(kind: .tracking, inputBuffer: inputBuffer, commandBuffer: commandBuffer)
     }
 
     // MARK: - Encode onto the tracker's own command buffer
@@ -198,13 +193,18 @@ public final class EfficientTAMVideoTracker
         prompts: [EfficientTAMPrompt]
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
-        let commandBuffer = try self.makeOwnedCommandBuffer()
-        return try self.encodeInitialFrame(
+        let commandBuffer = self.makeOwnedCommandBuffer()
+        let output = try self.encodeInitialFrame(
             inputBuffer: inputBuffer,
             prompts: prompts,
-            commandBuffer: commandBuffer,
-            commit: true
+            commandBuffer: commandBuffer
         )
+        // Nil means the frame was dropped before anything was encoded.
+        if output != nil
+        {
+            commandBuffer.commit()
+        }
+        return output
     }
 
     public func encodeInitialFrame(
@@ -213,29 +213,36 @@ public final class EfficientTAMVideoTracker
         promptLabelsBuffer: MTLBuffer
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
-        let commandBuffer = try self.makeOwnedCommandBuffer()
-        return try self.encodeInitialFrame(
+        let commandBuffer = self.makeOwnedCommandBuffer()
+        let output = try self.encodeInitialFrame(
             inputBuffer: inputBuffer,
             promptCoordinatesBuffer: promptCoordinatesBuffer,
             promptLabelsBuffer: promptLabelsBuffer,
-            commandBuffer: commandBuffer,
-            commit: true
+            commandBuffer: commandBuffer
         )
+        // Nil means the frame was dropped before anything was encoded.
+        if output != nil
+        {
+            commandBuffer.commit()
+        }
+        return output
     }
 
     public func encodeNextFrame(inputBuffer: MTLBuffer) throws -> EfficientTAMVideoTrackingOutput?
     {
-        let commandBuffer = try self.makeOwnedCommandBuffer()
-        return try self.encodeNextFrame(inputBuffer: inputBuffer, commandBuffer: commandBuffer, commit: true)
+        let commandBuffer = self.makeOwnedCommandBuffer()
+        let output = try self.encodeNextFrame(inputBuffer: inputBuffer, commandBuffer: commandBuffer)
+        // Nil means the frame was dropped before anything was encoded.
+        if output != nil
+        {
+            commandBuffer.commit()
+        }
+        return output
     }
 
-    private func makeOwnedCommandBuffer() throws -> MTLCommandBuffer
+    private func makeOwnedCommandBuffer() -> MPSCommandBuffer
     {
-        guard let rawCommandBuffer = self.commandQueue.makeCommandBuffer() else
-        {
-            throw EfficientTAMError("Could not create an EfficientTAM video command buffer.")
-        }
-        return MPSCommandBuffer(commandBuffer: rawCommandBuffer)
+        MPSCommandBuffer(from: self.commandQueue)
     }
 
     // MARK: - One frame
@@ -243,8 +250,7 @@ public final class EfficientTAMVideoTracker
     private func encodeFrame(
         kind: FrameKind,
         inputBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
         guard let submissionSlot = self.submissionSlots.tryAcquire() else { return nil }
@@ -283,16 +289,13 @@ public final class EfficientTAMVideoTracker
         entries = self.memoryEntries
         self.stateLock.unlock()
 
-        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
-        let encoding: MTLCommandBuffer = target.commandBuffer
         let buffers = try self.timedCPU(frameIndex, "frameBuffers") { try self.makeFrameBuffers() }
 
         var accepted = try self.timedCPU(frameIndex, "imageEncoder") {
             try self.imageEncoder.encode(
                 inputBuffer: inputBuffer,
                 outputBuffer: buffers.imageEmbedding,
-                commandBuffer: encoding,
-                commit: false
+                commandBuffer: commandBuffer
             )
         }
         switch kind
@@ -307,14 +310,13 @@ public final class EfficientTAMVideoTracker
                     iouPredictionsBuffer: buffers.candidateIoU,
                     objectScoreLogitBuffer: buffers.objectScore,
                     objectPointersBuffer: buffers.candidatePointers,
-                    commandBuffer: encoding,
-                    commit: false
+                    commandBuffer: commandBuffer
                 )
             }
         case .tracking:
             let attention = try self.memoryAttention()
             let snapshot = try self.timedCPU(frameIndex, "snapshot") {
-                try self.encodeSnapshot(from: entries, attention: attention, onto: encoding)
+                try self.encodeSnapshot(from: entries, attention: attention, onto: commandBuffer)
             }
             let keyMask = try self.keyMask(
                 attention: attention,
@@ -329,8 +331,7 @@ public final class EfficientTAMVideoTracker
                     objectPointersBuffer: snapshot.objectPointers,
                     keyMaskBuffer: keyMask,
                     outputBuffer: buffers.conditionedEmbedding,
-                    commandBuffer: encoding,
-                    commit: false
+                    commandBuffer: commandBuffer
                 )
             }
             accepted = try accepted && self.timedCPU(frameIndex, "decoder") {
@@ -342,8 +343,7 @@ public final class EfficientTAMVideoTracker
                     iouPredictionsBuffer: buffers.candidateIoU,
                     objectScoreLogitBuffer: buffers.objectScore,
                     objectPointersBuffer: buffers.candidatePointers,
-                    commandBuffer: encoding,
-                    commit: false
+                    commandBuffer: commandBuffer
                 )
             }
         }
@@ -355,8 +355,7 @@ public final class EfficientTAMVideoTracker
                 selectedMaskLogitsBuffer: buffers.selectedMask,
                 selectedIoUPredictionBuffer: buffers.selectedIoU,
                 selectedObjectPointerBuffer: buffers.selectedPointer,
-                commandBuffer: encoding,
-                commit: false
+                commandBuffer: commandBuffer
             )
         }
         accepted = try accepted && self.timedCPU(frameIndex, "memoryEncoder") {
@@ -364,8 +363,7 @@ public final class EfficientTAMVideoTracker
                 imageEmbeddingBuffer: buffers.imageEmbedding,
                 maskLogitsBuffer: buffers.selectedMask,
                 memoryFeaturesBuffer: buffers.memoryFeatures,
-                commandBuffer: encoding,
-                commit: false
+                commandBuffer: commandBuffer
             )
         }
         guard accepted else
@@ -374,8 +372,9 @@ public final class EfficientTAMVideoTracker
         }
 
         // The tracker's own slot returns when the final underlying buffer
-        // completes, which after an MPSGraph split is not the first one.
-        try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in
+        // completes, which after an MPSGraph split is not the first one --
+        // attaching to the caller's persistent wrapper targets its live root.
+        commandBuffer.addCompletedHandler { [weak self] _ in
             self?.submissionSlots.release(submissionSlot)
         }
         completionInstalled = true

@@ -101,13 +101,12 @@ private let frameHeight = 512
                     .init(x: 160, y: 300, label: .positivePoint),
                     .init(x: 0, y: 0, label: .padding),
                 ],
-                commandBuffer: frameCommandBuffer,
-                commit: false
+                commandBuffer: frameCommandBuffer
             )
         }
         else
         {
-            output = try tracker.encodeNextFrame(inputBuffer: modelInput, commandBuffer: frameCommandBuffer, commit: false)
+            output = try tracker.encodeNextFrame(inputBuffer: modelInput, commandBuffer: frameCommandBuffer)
         }
         outputs.append(try #require(output))
 

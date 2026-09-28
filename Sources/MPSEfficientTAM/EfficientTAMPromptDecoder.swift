@@ -338,8 +338,7 @@ public final class EfficientTAMPromptDecoder
         promptCoordinatesBuffer: MTLBuffer,
         promptLabelsBuffer: MTLBuffer,
         densePromptEmbeddingBuffer: MTLBuffer? = nil,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool,
+        commandBuffer: MPSCommandBuffer,
         completion: @escaping (Result<EfficientTAMMaskPrediction, any Error>) -> Void
     ) throws -> Bool
     {
@@ -370,11 +369,10 @@ public final class EfficientTAMPromptDecoder
                 completion(.failure(EfficientTAMError("EfficientTAM prompt decoding did not produce both outputs.")))
             }
         }
-        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: self.inputs(
                     imageEmbeddingBuffer: imageEmbeddingBuffer,
                     promptCoordinatesBuffer: promptCoordinatesBuffer,
@@ -384,10 +382,6 @@ public final class EfficientTAMPromptDecoder
                 results: nil,
                 executionDescriptor: descriptor
             )
-            if commit
-            {
-                mpsCommandBuffer.commit()
-            }
         }
         return true
     }
@@ -402,8 +396,7 @@ public final class EfficientTAMPromptDecoder
         iouPredictionsBuffer: MTLBuffer,
         objectScoreLogitBuffer: MTLBuffer? = nil,
         objectPointersBuffer: MTLBuffer? = nil,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> Bool
     {
         try self.validate(
@@ -442,12 +435,10 @@ public final class EfficientTAMPromptDecoder
         )
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
-        let mpsCommandBuffer = target.commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: self.inputs(
                     imageEmbeddingBuffer: imageEmbeddingBuffer,
                     promptCoordinatesBuffer: promptCoordinatesBuffer,
@@ -458,15 +449,11 @@ public final class EfficientTAMPromptDecoder
                 executionDescriptor: descriptor
             )
         }
-        do
-        {
-            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
-        }
-        catch
-        {
-            self.releaseSlot(slot)
-            throw error
-        }
+        // Added after MPSGraph finishes encoding: it may have called
+        // commitAndContinue, and attaching to the caller's persistent wrapper
+        // now targets its live root, so the slot is released only when the
+        // graph's final segment completes.
+        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         return true
     }
 

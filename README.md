@@ -49,13 +49,14 @@ can schedule each stage independently or compose them into a larger graph.
 
 ```swift
 import Metal
+import MetalPerformanceShaders
 import MPSEfficientTAM
 
 let device = MTLCreateSystemDefaultDevice()!
 let commandQueue = device.makeCommandQueue()!
 let encoder = try EfficientTAMImageEncoder(commandQueue: commandQueue)
 
-let commandBuffer = commandQueue.makeCommandBuffer()!
+let commandBuffer = MPSCommandBuffer(from: commandQueue)
 let output = device.makeBuffer(
     length: encoder.outputBufferLength,
     options: .storageModePrivate
@@ -64,9 +65,9 @@ let output = device.makeBuffer(
 let accepted = try encoder.encode(
     inputBuffer: rgbFloat32NHWCBuffer,
     outputBuffer: output,
-    commandBuffer: commandBuffer,
-    commit: true
+    commandBuffer: commandBuffer
 )
+commandBuffer.commit()
 
 let decoder = try EfficientTAMPromptDecoder(promptCount: 2, commandQueue: commandQueue)
 let prediction = try decoder.run(
@@ -87,14 +88,14 @@ let densePrompt = device.makeBuffer(
     length: maskPromptEncoder.outputBufferLength,
     options: .storageModePrivate
 )!
-let maskPromptCommandBuffer = commandQueue.makeCommandBuffer()!
+let maskPromptCommandBuffer = MPSCommandBuffer(from: commandQueue)
 
 _ = try maskPromptEncoder.encode(
     maskLogitsBuffer: prior128x128Logits,
     densePromptEmbeddingBuffer: densePrompt,
-    commandBuffer: maskPromptCommandBuffer,
-    commit: true
+    commandBuffer: maskPromptCommandBuffer
 )
+maskPromptCommandBuffer.commit()
 
 let refinedPrediction = try decoder.run(
     imageEmbeddingBuffer: output,
@@ -140,19 +141,18 @@ let first = try tracker.encodeInitialFrame(
         .init(x: 160, y: 300, label: .positivePoint),
         .init(x: 0, y: 0, label: .padding),
     ],
-    commandBuffer: frameCommandBuffer,
-    commit: false
+    commandBuffer: frameCommandBuffer
 )
 
 // Later frames: returns nil (a dropped frame) when maxFramesInFlight are busy.
-if let output = try tracker.encodeNextFrame(inputBuffer: modelInput, commandBuffer: frameCommandBuffer, commit: false)
+if let output = try tracker.encodeNextFrame(inputBuffer: modelInput, commandBuffer: frameCommandBuffer)
 {
     // output.maskLogitsBuffer        [128, 128] raw logits, feed EfficientTAMMaskPostprocessor
     // output.objectScoreLogitBuffer  object-presence logit; <= 0 means occluded/absent
     // output.iouPredictionBuffer, output.objectPointerBuffer, output.memoryFeaturesBuffer
 }
 
-// Without a frame command buffer, the tracker uses its own queue and commits:
+// Without a frame command buffer, the tracker creates and commits its own:
 // tracker.encodeInitialFrame(inputBuffer:prompts:) / tracker.encodeNextFrame(inputBuffer:)
 
 tracker.reset()   // start a new sequence
@@ -185,23 +185,19 @@ frames, direct mask conditioning, reverse tracking, and multiple objects.
 
 ## Command-buffer ownership
 
-Every stage's `encode(..., commandBuffer:, commit:)` takes any `MTLCommandBuffer`.
+Every stage's `encode(..., commandBuffer:)` and `submit(..., commandBuffer:, completion:)`
+take the caller's own `MPSCommandBuffer` and never wrap, commit, or wait on it.
+The caller commits it (Fabric's per-frame buffer is one).
 
-**Pass an `MPSCommandBuffer` when you have one** (Fabric's per-frame buffer is one).
 `MPSGraphExecutable.encode` may `commitAndContinue`, which commits the underlying
 Metal buffer and swaps a new one into the same `MPSCommandBuffer`. Stages encode
-onto the instance you pass and never wrap it again, so any number of stages, and
-your own blits and compute passes, can be encoded back to back onto one buffer
-with `commit: false`, and you commit that buffer once yourself. Completion
-handlers are registered on the live underlying buffer after encoding, so they
-fire when the last segment completes.
+onto the instance you pass, so any number of stages, and your own blits and
+compute passes, can be encoded back to back onto one buffer, and you commit that
+buffer once yourself. Completion handlers are registered on the live underlying
+buffer after encoding, so they fire when the last segment completes.
 
-**A plain `MTLCommandBuffer`** is wrapped for you, which is only safe when that
-call is also the one that commits it: use `commit: true`. Passing `commit: false`
-with a plain buffer throws if MPSGraph split the work, because the remainder
-would be stranded in a wrapper you cannot reach.
-
-Do not commit the raw buffer yourself in either case.
+`run(...)` is the synchronous path: it creates, commits, and waits on its own
+command buffer.
 
 ## Accuracy tests
 

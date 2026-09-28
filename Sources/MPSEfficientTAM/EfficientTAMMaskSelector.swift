@@ -122,8 +122,7 @@ public final class EfficientTAMMaskSelector
         maskLogitsBuffer: MTLBuffer,
         iouPredictionsBuffer: MTLBuffer,
         objectPointersBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool,
+        commandBuffer: MPSCommandBuffer,
         completion: @escaping (Result<EfficientTAMSelectedMask, any Error>) -> Void
     ) throws -> Bool
     {
@@ -143,16 +142,14 @@ public final class EfficientTAMMaskSelector
             else if results.count == 3 { completion(.success(self.selection(from: results, slot: slot))) }
             else { completion(.failure(EfficientTAMError("EfficientTAM mask selection did not produce all outputs."))) }
         }
-        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: self.inputs(masks: maskLogitsBuffer, iou: iouPredictionsBuffer, pointers: objectPointersBuffer),
                 results: nil,
                 executionDescriptor: descriptor
             )
-            if commit { mpsCommandBuffer.commit() }
         }
         return true
     }
@@ -165,8 +162,7 @@ public final class EfficientTAMMaskSelector
         selectedMaskLogitsBuffer: MTLBuffer,
         selectedIoUPredictionBuffer: MTLBuffer,
         selectedObjectPointerBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> Bool
     {
         try self.validate(
@@ -185,26 +181,20 @@ public final class EfficientTAMMaskSelector
         ).map { MPSGraphTensorData($0.0, shape: $0.1.shape ?? [], dataType: .float32) }
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
-        let mpsCommandBuffer = target.commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: self.inputs(masks: maskLogitsBuffer, iou: iouPredictionsBuffer, pointers: objectPointersBuffer),
                 results: outputs,
                 executionDescriptor: descriptor
             )
         }
-        do
-        {
-            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
-        }
-        catch
-        {
-            self.releaseSlot(slot)
-            throw error
-        }
+        // Added after MPSGraph finishes encoding: it may have called
+        // commitAndContinue, and attaching to the caller's persistent wrapper
+        // now targets its live root, so the slot is released only when the
+        // graph's final segment completes.
+        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         return true
     }
 

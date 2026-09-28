@@ -144,8 +144,7 @@ public final class EfficientTAMImageEncoder
     @discardableResult
     public func submit(
         inputBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool,
+        commandBuffer: MPSCommandBuffer,
         completion: @escaping (Result<[Float], any Error>) -> Void
     ) throws -> Bool
     {
@@ -172,19 +171,14 @@ public final class EfficientTAMImageEncoder
         }
 
         let inputData = MPSGraphTensorData(inputBuffer, shape: self.inputTensor.shape ?? [], dataType: .float32)
-        let mpsCommandBuffer = EfficientTAMCommandBuffer.target(for: commandBuffer).commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: [inputData],
                 results: nil,
                 executionDescriptor: executionDescriptor
             )
-            if commit
-            {
-                mpsCommandBuffer.commit()
-            }
         }
         return true
     }
@@ -195,8 +189,7 @@ public final class EfficientTAMImageEncoder
     public func encode(
         inputBuffer: MTLBuffer,
         outputBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> Bool
     {
         try self.validate(inputBuffer: inputBuffer, commandBuffer: commandBuffer)
@@ -212,26 +205,20 @@ public final class EfficientTAMImageEncoder
         let outputData = MPSGraphTensorData(outputBuffer, shape: self.outputTensor.shape ?? [], dataType: .float32)
         let executionDescriptor = MPSGraphExecutableExecutionDescriptor()
         executionDescriptor.waitUntilCompleted = false
-        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
-        let mpsCommandBuffer = target.commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: [inputData],
                 results: [outputData],
                 executionDescriptor: executionDescriptor
             )
         }
-        do
-        {
-            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
-        }
-        catch
-        {
-            self.releaseSlot(slot)
-            throw error
-        }
+        // Added after MPSGraph finishes encoding: it may have called
+        // commitAndContinue, and attaching to the caller's persistent wrapper
+        // now targets its live root, so the slot is released only when the
+        // graph's final segment completes.
+        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         return true
     }
 

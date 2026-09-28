@@ -349,8 +349,7 @@ public final class EfficientTAMMemoryAttention
         objectPointersBuffer: MTLBuffer? = nil,
         keyMaskBuffer: MTLBuffer? = nil,
         outputBuffer: MTLBuffer,
-        commandBuffer: MTLCommandBuffer,
-        commit: Bool
+        commandBuffer: MPSCommandBuffer
     ) throws -> Bool
     {
         try self.validate(
@@ -366,12 +365,10 @@ public final class EfficientTAMMemoryAttention
         let output = MPSGraphTensorData(outputBuffer, shape: self.outputTensor.shape ?? [], dataType: .float32)
         let descriptor = MPSGraphExecutableExecutionDescriptor()
         descriptor.waitUntilCompleted = false
-        let target = EfficientTAMCommandBuffer.target(for: commandBuffer)
-        let mpsCommandBuffer = target.commandBuffer
         autoreleasepool
         {
             _ = self.executable.encode(
-                to: mpsCommandBuffer,
+                to: commandBuffer,
                 inputs: self.inputs(
                     imageEmbeddingBuffer: imageEmbeddingBuffer,
                     memoryFeaturesBuffer: memoryFeaturesBuffer,
@@ -383,15 +380,11 @@ public final class EfficientTAMMemoryAttention
                 executionDescriptor: descriptor
             )
         }
-        do
-        {
-            try EfficientTAMCommandBuffer.finish(target, commit: commit) { [weak self] in self?.releaseSlot(slot) }
-        }
-        catch
-        {
-            self.releaseSlot(slot)
-            throw error
-        }
+        // Added after MPSGraph finishes encoding: it may have called
+        // commitAndContinue, and attaching to the caller's persistent wrapper
+        // now targets its live root, so the slot is released only when the
+        // graph's final segment completes.
+        commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
         return true
     }
 
