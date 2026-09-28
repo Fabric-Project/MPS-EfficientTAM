@@ -193,7 +193,7 @@ public final class EfficientTAMVideoTracker
         prompts: [EfficientTAMPrompt]
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
-        let commandBuffer = self.makeOwnedCommandBuffer()
+        let commandBuffer = try self.makeOwnedCommandBuffer()
         let output = try self.encodeInitialFrame(
             inputBuffer: inputBuffer,
             prompts: prompts,
@@ -213,7 +213,7 @@ public final class EfficientTAMVideoTracker
         promptLabelsBuffer: MTLBuffer
     ) throws -> EfficientTAMVideoTrackingOutput?
     {
-        let commandBuffer = self.makeOwnedCommandBuffer()
+        let commandBuffer = try self.makeOwnedCommandBuffer()
         let output = try self.encodeInitialFrame(
             inputBuffer: inputBuffer,
             promptCoordinatesBuffer: promptCoordinatesBuffer,
@@ -230,7 +230,7 @@ public final class EfficientTAMVideoTracker
 
     public func encodeNextFrame(inputBuffer: MTLBuffer) throws -> EfficientTAMVideoTrackingOutput?
     {
-        let commandBuffer = self.makeOwnedCommandBuffer()
+        let commandBuffer = try self.makeOwnedCommandBuffer()
         let output = try self.encodeNextFrame(inputBuffer: inputBuffer, commandBuffer: commandBuffer)
         // Nil means the frame was dropped before anything was encoded.
         if output != nil
@@ -240,9 +240,18 @@ public final class EfficientTAMVideoTracker
         return output
     }
 
-    private func makeOwnedCommandBuffer() -> MPSCommandBuffer
+    /// A raw queue buffer wrapped once, which this tracker then owns and
+    /// commits. Not `MPSCommandBuffer(from:)`: that autoreleases its root
+    /// buffer, and callers that retry in a tight loop without draining an
+    /// autorelease pool (dropped frames create and discard one per attempt)
+    /// exhaust the queue's command-buffer limit and block forever.
+    private func makeOwnedCommandBuffer() throws -> MPSCommandBuffer
     {
-        MPSCommandBuffer(from: self.commandQueue)
+        guard let rawCommandBuffer = self.commandQueue.makeCommandBuffer() else
+        {
+            throw EfficientTAMError("Could not create an EfficientTAM video command buffer.")
+        }
+        return MPSCommandBuffer(commandBuffer: rawCommandBuffer)
     }
 
     // MARK: - One frame

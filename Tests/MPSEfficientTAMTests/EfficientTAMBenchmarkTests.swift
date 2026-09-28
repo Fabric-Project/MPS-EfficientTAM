@@ -140,8 +140,8 @@ func memoryLeakProbe() throws
             var done = 0
             while done < count
             {
-                guard let out = output() else { break }
-                let commandBuffer = MPSCommandBuffer(from: queue)
+                guard let out = output(), let rawCommandBuffer = queue.makeCommandBuffer() else { break }
+                let commandBuffer = MPSCommandBuffer(commandBuffer: rawCommandBuffer)
                 let accepted = try encoder.encode(
                     inputBuffer: inputBuffers[done % inputBuffers.count],
                     outputBuffer: out,
@@ -180,7 +180,8 @@ func memoryLeakProbe() throws
             var done = 0
             while done < 100
             {
-                let commandBuffer = MPSCommandBuffer(from: commandQueue)
+                guard let rawCommandBuffer = commandQueue.makeCommandBuffer() else { break }
+                let commandBuffer = MPSCommandBuffer(commandBuffer: rawCommandBuffer)
                 let accepted = try encoder.submit(inputBuffer: inputBuffers[done % 4], commandBuffer: commandBuffer, completion: { _ in })
                 commandBuffer.commit()
                 if accepted
