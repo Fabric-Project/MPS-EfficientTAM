@@ -12,34 +12,44 @@ enum EfficientTAMAttentionOps
 
     /// `query` is `[B, H, Nq, F]`, `key` and `value` are `[B, H, Nkv, F]`. The
     /// optional additive `mask` must broadcast against `[B, H, Nq, Nkv]`.
+    /// The two matmuls run in `precision.layerDataType`; the scale, mask and
+    /// softmax in `precision.activationDataType`, which is also the result's
+    /// type. At float32 no casts are added.
     static func attention(
         graph: MPSGraph,
         query: MPSGraphTensor,
         key: MPSGraphTensor,
         value: MPSGraphTensor,
         mask: MPSGraphTensor?,
-        scale: Float
+        scale: Float,
+        precision: EfficientTAMPrecision = .float32
     ) -> MPSGraphTensor
     {
+        let layerType = precision.layerDataType
+        let activationType = precision.activationDataType
+        func cast(_ tensor: MPSGraphTensor, to dataType: MPSDataType) -> MPSGraphTensor
+        {
+            tensor.dataType == dataType ? tensor : graph.cast(tensor, to: dataType, name: nil)
+        }
         if self.usesFusedAttention
         {
-            return graph.scaledDotProductAttention(
-                query: query,
-                key: key,
-                value: value,
-                mask: mask,
+            return cast(graph.scaledDotProductAttention(
+                query: cast(query, to: layerType),
+                key: cast(key, to: layerType),
+                value: cast(value, to: layerType),
+                mask: mask.map { cast($0, to: layerType) },
                 scale: scale,
                 name: nil
-            )
+            ), to: activationType)
         }
-        let transposedKey = graph.transpose(key, permutation: [0, 1, 3, 2], name: nil)
-        var scores = graph.matrixMultiplication(primary: query, secondary: transposedKey, name: nil)
-        scores = graph.multiplication(scores, graph.constant(Double(scale), dataType: .float32), name: nil)
+        let transposedKey = graph.transpose(cast(key, to: layerType), permutation: [0, 1, 3, 2], name: nil)
+        var scores = cast(graph.matrixMultiplication(primary: cast(query, to: layerType), secondary: transposedKey, name: nil), to: activationType)
+        scores = graph.multiplication(scores, graph.constant(Double(scale), dataType: activationType), name: nil)
         if let mask
         {
-            scores = graph.addition(scores, mask, name: nil)
+            scores = graph.addition(scores, cast(mask, to: activationType), name: nil)
         }
         let probabilities = graph.softMax(with: scores, axis: 3, name: nil)
-        return graph.matrixMultiplication(primary: probabilities, secondary: value, name: nil)
+        return cast(graph.matrixMultiplication(primary: cast(probabilities, to: layerType), secondary: cast(value, to: layerType), name: nil), to: activationType)
     }
 }

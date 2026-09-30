@@ -62,12 +62,14 @@ import Testing
     {
         return
     }
+    let precision = efficientTAMTestPrecision()
     let attention = try EfficientTAMMemoryAttention(
         memoryFrameCount: 7,
         objectPointerCount: 16,
         usesKeyMask: true,
         commandQueue: commandQueue,
-        maxFramesInFlight: 1
+        maxFramesInFlight: 1,
+        precision: precision
     )
     let image = try attentionFixture(named: "attention_current_embedding_reference")
     let memory = try attentionFixture(named: "attention_memory_features_reference")
@@ -104,9 +106,34 @@ import Testing
     let errors = zip(actual, reference).map { abs($0 - $1) }
     let meanAbsoluteError = errors.reduce(0, +) / Float(errors.count)
     let maximumAbsoluteError = errors.max() ?? .infinity
-    print("Masked memory attention MAE=\(meanAbsoluteError), max=\(maximumAbsoluteError)")
-    #expect(meanAbsoluteError < 0.002)
-    #expect(maximumAbsoluteError < 0.03)
+    print("Masked memory attention \(precision) vs PyTorch: MAE=\(meanAbsoluteError), max=\(maximumAbsoluteError)")
+    if precision == .float32
+    {
+        #expect(meanAbsoluteError < 0.002)
+        #expect(maximumAbsoluteError < 0.03)
+    }
+    else
+    {
+        // Reduced tiers: 40 dB against the float32 masked graph on the same inputs.
+        let float32Output = try EfficientTAMMemoryAttention(
+            memoryFrameCount: 7,
+            objectPointerCount: 16,
+            usesKeyMask: true,
+            commandQueue: commandQueue,
+            maxFramesInFlight: 1
+        ).run(
+            imageEmbeddingBuffer: imageBuffer,
+            memoryFeaturesBuffer: memoryBuffer,
+            memoryPositionBuffer: generatedPositionBuffer,
+            objectPointersBuffer: pointerBuffer,
+            keyMaskBuffer: keyMask
+        )
+        let nonFiniteCount = actual.filter { !$0.isFinite }.count
+        let psnr = efficientTAMPSNR(actual, float32Output)
+        print("Masked memory attention \(precision) vs float32: \(psnr.formatted(.number.precision(.fractionLength(1)))) dB, \(nonFiniteCount) non-finite")
+        #expect(nonFiniteCount == 0)
+        #expect(psnr > 40)
+    }
 }
 
 private func attentionFixture(named name: String) throws -> [Float]

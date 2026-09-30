@@ -10,7 +10,8 @@ import Testing
     {
         return
     }
-    let encoder = try EfficientTAMMemoryEncoder(commandQueue: commandQueue, maxFramesInFlight: 1)
+    let precision = efficientTAMTestPrecision()
+    let encoder = try EfficientTAMMemoryEncoder(commandQueue: commandQueue, maxFramesInFlight: 1, precision: precision)
     let imageEmbedding = try memoryFixture(named: "encoder_reference")
     let selectedMask = try memoryFixture(named: "memory_selected_mask_reference")
     guard let imageEmbeddingBuffer = device.makeBuffer(
@@ -32,9 +33,25 @@ import Testing
     let errors = zip(actual, reference).map { abs($0 - $1) }
     let meanAbsoluteError = errors.reduce(0, +) / Float(errors.count)
     let maximumAbsoluteError = errors.max() ?? .infinity
-    print("Memory encoder MAE=\(meanAbsoluteError), max=\(maximumAbsoluteError)")
-    #expect(meanAbsoluteError < 0.001)
-    #expect(maximumAbsoluteError < 0.02)
+    print("Memory encoder \(precision) vs PyTorch: MAE=\(meanAbsoluteError), max=\(maximumAbsoluteError)")
+    if precision == .float32
+    {
+        #expect(meanAbsoluteError < 0.001)
+        #expect(maximumAbsoluteError < 0.02)
+    }
+    else
+    {
+        // Reduced tiers: 40 dB against the float32 encoder on the same inputs.
+        let float32Output = try EfficientTAMMemoryEncoder(commandQueue: commandQueue, maxFramesInFlight: 1).run(
+            imageEmbeddingBuffer: imageEmbeddingBuffer,
+            maskLogitsBuffer: selectedMaskBuffer
+        )
+        let nonFiniteCount = actual.filter { !$0.isFinite }.count
+        let psnr = efficientTAMPSNR(actual, float32Output)
+        print("Memory encoder \(precision) vs float32: \(psnr.formatted(.number.precision(.fractionLength(1)))) dB, \(nonFiniteCount) non-finite")
+        #expect(nonFiniteCount == 0)
+        #expect(psnr > 40)
+    }
 }
 
 @Test func memoryPositionEmbeddingMatchesOfficialPyTorch() throws

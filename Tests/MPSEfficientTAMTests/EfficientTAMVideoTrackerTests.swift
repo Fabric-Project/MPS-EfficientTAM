@@ -24,9 +24,11 @@ private let frameHeight = 512
     {
         return
     }
+    let precision = efficientTAMTestPrecision()
     let tracker = try EfficientTAMVideoTracker(
         commandQueue: commandQueue,
-        maxFramesInFlight: frameCount
+        maxFramesInFlight: frameCount,
+        precision: precision
     )
     let frames = try trackerFixtureBytes(named: "tracker_frames_rgb_uint8")
     let frameLength = frameWidth * frameHeight * 3
@@ -56,7 +58,7 @@ private let frameHeight = 512
     }
     #expect(outputs.map(\.frameIndex) == Array(0..<frameCount))
 
-    try verifyTrackerOutputs(outputs, device: device, commandQueue: commandQueue)
+    try verifyTrackerOutputs(outputs, device: device, commandQueue: commandQueue, precision: precision)
 }
 
 /// The Fabric-style flow: one `MPSCommandBuffer` per frame, "upstream" GPU work
@@ -177,7 +179,8 @@ private let frameHeight = 512
 private func verifyTrackerOutputs(
     _ outputs: [EfficientTAMVideoTrackingOutput],
     device: MTLDevice,
-    commandQueue: MTLCommandQueue
+    commandQueue: MTLCommandQueue,
+    precision: EfficientTAMPrecision = .float32
 ) throws
 {
     // One blit pass and one wait for the whole sequence.
@@ -245,15 +248,29 @@ private func verifyTrackerOutputs(
                 + "pointer MAE=\(pointerError.mean) max=\(pointerError.max), "
                 + "memory MAE=\(memoryError.mean) max=\(memoryError.max)"
         )
-        // Observed errors are ~1e-5 (mask/memory) and ~1e-6 (pointer/score);
-        // bounds leave roughly 5-10x headroom.
-        #expect(maskError.mean < 5e-5, "frame \(index) mask MAE")
-        #expect(maskError.max < 1e-3, "frame \(index) mask max error")
-        #expect(iouError < 1e-4, "frame \(index) IoU")
-        #expect(scoreError < 1e-3, "frame \(index) object score")
-        #expect(pointerError.max < 1e-4, "frame \(index) object pointer")
-        #expect(memoryError.mean < 1e-5, "frame \(index) memory MAE")
-        #expect(memoryError.max < 3e-4, "frame \(index) memory max error")
+        if precision == .float32
+        {
+            // Observed errors are ~1e-5 (mask/memory) and ~1e-6 (pointer/score);
+            // bounds leave roughly 5-10x headroom.
+            #expect(maskError.mean < 5e-5, "frame \(index) mask MAE")
+            #expect(maskError.max < 1e-3, "frame \(index) mask max error")
+            #expect(iouError < 1e-4, "frame \(index) IoU")
+            #expect(scoreError < 1e-3, "frame \(index) object score")
+            #expect(pointerError.max < 1e-4, "frame \(index) object pointer")
+            #expect(memoryError.mean < 1e-5, "frame \(index) memory MAE")
+            #expect(memoryError.max < 3e-4, "frame \(index) memory max error")
+        }
+        else if index != occludedFrameIndex
+        {
+            // Reduced tiers track rather than match: the foreground (logit > 0)
+            // must agree with PyTorch's at 0.9 intersection-over-union.
+            let referenceMask = referenceMasks[(index * maskLength)..<((index + 1) * maskLength)]
+            let intersection = zip(mask, referenceMask).filter { $0.0 > 0 && $0.1 > 0 }.count
+            let union = zip(mask, referenceMask).filter { $0.0 > 0 || $0.1 > 0 }.count
+            let foregroundAgreement = union == 0 ? 1 : Double(intersection) / Double(union)
+            print("Tracker frame \(index) \(precision): foreground IoU vs PyTorch \(foregroundAgreement.formatted(.number.precision(.fractionLength(4))))")
+            #expect(foregroundAgreement > 0.9, "frame \(index) foreground agreement")
+        }
         if index == occludedFrameIndex
         {
             #expect(score < 0, "object should be absent on the occluded frame")

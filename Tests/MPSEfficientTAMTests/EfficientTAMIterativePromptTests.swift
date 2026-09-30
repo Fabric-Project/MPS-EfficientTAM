@@ -11,7 +11,8 @@ import Testing
     {
         return
     }
-    let encoder = try EfficientTAMMaskPromptEncoder(commandQueue: commandQueue, maxFramesInFlight: 1)
+    let precision = efficientTAMTestPrecision()
+    let encoder = try EfficientTAMMaskPromptEncoder(commandQueue: commandQueue, maxFramesInFlight: 1, precision: precision)
     let priorMask = iterativePriorMask()
     guard let priorMaskBuffer = device.makeBuffer(
         bytes: priorMask,
@@ -26,9 +27,22 @@ import Testing
     let errors = zip(actual, reference).map { abs($0 - $1) }
     let meanAbsoluteError = errors.reduce(0, +) / Float(errors.count)
     let maximumAbsoluteError = errors.max() ?? .infinity
-    print("Mask-prompt embedding MAE=\(meanAbsoluteError), max=\(maximumAbsoluteError)")
-    #expect(meanAbsoluteError < 0.0002)
-    #expect(maximumAbsoluteError < 0.003)
+    print("Mask-prompt embedding \(precision) vs PyTorch: MAE=\(meanAbsoluteError), max=\(maximumAbsoluteError)")
+    if precision == .float32
+    {
+        #expect(meanAbsoluteError < 0.0002)
+        #expect(maximumAbsoluteError < 0.003)
+    }
+    else
+    {
+        // Reduced tiers: 40 dB against the float32 encoder on the same input.
+        let float32Output = try EfficientTAMMaskPromptEncoder(commandQueue: commandQueue, maxFramesInFlight: 1).run(maskLogitsBuffer: priorMaskBuffer)
+        let nonFiniteCount = actual.filter { !$0.isFinite }.count
+        let psnr = efficientTAMPSNR(actual, float32Output)
+        print("Mask-prompt embedding \(precision) vs float32: \(psnr.formatted(.number.precision(.fractionLength(1)))) dB, \(nonFiniteCount) non-finite")
+        #expect(nonFiniteCount == 0)
+        #expect(psnr > 40)
+    }
 }
 
 @Test func iterativePromptDecoderMatchesOfficialPyTorch() throws

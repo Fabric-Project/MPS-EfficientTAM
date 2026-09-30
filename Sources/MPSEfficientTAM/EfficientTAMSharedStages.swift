@@ -37,6 +37,8 @@ final class EfficientTAMSharedStages
     let memoryEncoder: EfficientTAMMemoryEncoder
 
     private let commandQueue: MTLCommandQueue
+    private let precision: EfficientTAMPrecision
+    private let computeUnits: EfficientTAMComputeUnits
     private let attentionLock = NSLock()
     private var maskedAttention: EfficientTAMMemoryAttention?
 
@@ -46,41 +48,59 @@ final class EfficientTAMSharedStages
         init(_ stages: EfficientTAMSharedStages) { self.stages = stages }
     }
 
-    private static let cacheLock = NSLock()
-    private static var cache: [UInt64: WeakStages] = [:]
-
-    static func stages(commandQueue: MTLCommandQueue) throws -> EfficientTAMSharedStages
+    /// One set of stages per device, precision and compute units: trackers
+    /// share compiled graphs only when they were built the same way.
+    private struct CacheKey: Hashable
     {
-        let deviceIdentifier = commandQueue.device.registryID
+        let deviceIdentifier: UInt64
+        let precision: EfficientTAMPrecision
+        let computeUnits: EfficientTAMComputeUnits
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cache: [CacheKey: WeakStages] = [:]
+
+    static func stages(commandQueue: MTLCommandQueue, precision: EfficientTAMPrecision, computeUnits: EfficientTAMComputeUnits) throws -> EfficientTAMSharedStages
+    {
+        let key = CacheKey(deviceIdentifier: commandQueue.device.registryID, precision: precision, computeUnits: computeUnits)
         self.cacheLock.lock()
         defer { self.cacheLock.unlock() }
 
         self.cache = self.cache.filter { $0.value.stages != nil }
-        if let existing = self.cache[deviceIdentifier]?.stages { return existing }
-        let created = try EfficientTAMSharedStages(commandQueue: commandQueue)
-        self.cache[deviceIdentifier] = WeakStages(created)
+        if let existing = self.cache[key]?.stages { return existing }
+        let created = try EfficientTAMSharedStages(commandQueue: commandQueue, precision: precision, computeUnits: computeUnits)
+        self.cache[key] = WeakStages(created)
         return created
     }
 
-    private init(commandQueue: MTLCommandQueue) throws
+    private init(commandQueue: MTLCommandQueue, precision: EfficientTAMPrecision, computeUnits: EfficientTAMComputeUnits) throws
     {
         self.commandQueue = commandQueue
+        self.precision = precision
+        self.computeUnits = computeUnits
         self.imageEncoder = try EfficientTAMImageEncoder(
             commandQueue: commandQueue,
-            maxFramesInFlight: Self.framesInFlight
+            maxFramesInFlight: Self.framesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
         self.promptDecoder = try EfficientTAMPromptDecoder(
             promptCount: Self.promptTokenCount,
             commandQueue: commandQueue,
-            maxFramesInFlight: Self.framesInFlight
+            maxFramesInFlight: Self.framesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
         self.maskSelector = try EfficientTAMMaskSelector(
             commandQueue: commandQueue,
-            maxFramesInFlight: Self.framesInFlight
+            maxFramesInFlight: Self.framesInFlight,
+            computeUnits: computeUnits
         )
         self.memoryEncoder = try EfficientTAMMemoryEncoder(
             commandQueue: commandQueue,
-            maxFramesInFlight: Self.framesInFlight
+            maxFramesInFlight: Self.framesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
     }
 
@@ -97,7 +117,9 @@ final class EfficientTAMSharedStages
             objectPointerCount: EfficientTAMVideoTracker.maximumObjectPointerCount,
             usesKeyMask: true,
             commandQueue: self.commandQueue,
-            maxFramesInFlight: Self.framesInFlight
+            maxFramesInFlight: Self.framesInFlight,
+            precision: self.precision,
+            computeUnits: self.computeUnits
         )
         self.maskedAttention = attention
         return attention

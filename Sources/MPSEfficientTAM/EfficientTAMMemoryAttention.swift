@@ -58,7 +58,9 @@ public final class EfficientTAMMemoryAttention
         objectPointerCount: Int,
         usesKeyMask: Bool = false,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard let binaryURL = Bundle.module.url(
@@ -80,7 +82,9 @@ public final class EfficientTAMMemoryAttention
             objectPointerCount: objectPointerCount,
             usesKeyMask: usesKeyMask,
             commandQueue: commandQueue,
-            maxFramesInFlight: maxFramesInFlight
+            maxFramesInFlight: maxFramesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
     }
 
@@ -91,7 +95,9 @@ public final class EfficientTAMMemoryAttention
         objectPointerCount: Int,
         usesKeyMask: Bool = false,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard memoryFrameCount > 0, objectPointerCount >= 0 else
@@ -188,7 +194,8 @@ public final class EfficientTAMMemoryAttention
             graph: self.graph,
             weights: weights,
             memoryFrameCount: memoryFrameCount,
-            objectPointerCount: objectPointerCount
+            objectPointerCount: objectPointerCount,
+            precision: precision
         )
         self.outputTensor = try builder.build(
             imageEmbedding: image,
@@ -216,7 +223,7 @@ public final class EfficientTAMMemoryAttention
             feeds[keyMask] = MPSGraphShapedType(shape: keyMask.shape ?? [], dataType: .float32)
         }
         let descriptor = MPSGraphCompilationDescriptor()
-        descriptor.optimizationLevel = .level1
+        descriptor.optimizationLevel = computeUnits.optimizationLevel
         descriptor.waitForCompilationCompletion = true
         let compiled = self.graph.compile(
             with: device,
@@ -507,6 +514,7 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
     let weights: EfficientTAMWeights
     let memoryFrameCount: Int
     let objectPointerCount: Int
+    let precision: EfficientTAMPrecision
 
     func build(
         imageEmbedding: MPSGraphTensor,
@@ -517,11 +525,11 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
     ) throws -> MPSGraphTensor
     {
         let noMemory = self.graph.reshape(
-            try self.weights.constant(self.graph, named: "no_mem_embed"),
+            try self.weights.constant(self.graph, named: "no_mem_embed", dataType: self.precision.activationDataType),
             shape: [1, 256, 1, 1],
             name: nil
         )
-        let rawImage = self.graph.subtraction(imageEmbedding, noMemory, name: nil)
+        let rawImage = self.graph.subtraction(self.toActivationType(imageEmbedding), noMemory, name: nil)
         var current = self.graph.reshape(rawImage, shape: [1, 256, 1024], name: nil)
         current = self.graph.transpose(current, permutation: [0, 2, 1], name: nil)
         let currentPosition = self.currentPositionEmbedding()
@@ -531,12 +539,12 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
             name: nil
         )
 
-        var memory = self.flattenMemory(memoryFeatures)
-        var position = self.flattenMemory(memoryPosition)
+        var memory = self.flattenMemory(self.toActivationType(memoryFeatures))
+        var position = self.flattenMemory(self.toActivationType(memoryPosition))
         if let objectPointers
         {
             let pointerTokens = self.graph.reshape(
-                objectPointers,
+                self.toActivationType(objectPointers),
                 shape: [1, (self.objectPointerCount * 4) as NSNumber, 64],
                 name: nil
             )
@@ -544,7 +552,7 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
             let zeroPosition = self.graph.constant(
                 0,
                 shape: [1, (self.objectPointerCount * 4) as NSNumber, 64],
-                dataType: .float32
+                dataType: self.precision.activationDataType
             )
             position = self.graph.concatTensors([position, zeroPosition], dimension: 1, name: nil)
         }
@@ -585,7 +593,10 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
         }
         current = try self.layerNorm(current, prefix: "memory_attention.norm")
         current = self.graph.transpose(current, permutation: [0, 2, 1], name: nil)
-        return self.graph.reshape(current, shape: [1, 256, 32, 32], name: "conditioned_image_embedding")
+        current = self.graph.reshape(current, shape: [1, 256, 32, 32], name: nil)
+        return current.dataType == .float32
+            ? self.graph.identity(with: current, name: "conditioned_image_embedding")
+            : self.graph.cast(current, to: .float32, name: "conditioned_image_embedding")
     }
 
     private func flattenMemory(_ input: MPSGraphTensor) -> MPSGraphTensor
@@ -644,7 +655,8 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
             key: self.graph.reshape(projectedKey, shape: [1, 1, keyCount, 256], name: nil),
             value: self.graph.reshape(projectedValue, shape: [1, 1, keyCount, 256], name: nil),
             mask: keyMask.map { self.graph.reshape($0, shape: [1, 1, 1, keyCount], name: nil) },
-            scale: 1 / sqrt(Float(256))
+            scale: 1 / sqrt(Float(256)),
+            precision: self.precision
         )
         return try self.linear(
             self.graph.reshape(attended, shape: [1, 1024, 256], name: nil),
@@ -659,16 +671,16 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
         let real = self.graph.sliceTensor(reshaped, dimension: 3, start: 0, length: 1, name: nil)
         let imaginary = self.graph.sliceTensor(reshaped, dimension: 3, start: 1, length: 1, name: nil)
         let frequencies = Self.rotaryFrequencies(repeats: repeats)
-        let cosine = self.graph.constant(
+        let cosine = self.toActivationType(self.graph.constant(
             Data(bytes: frequencies.cosine, count: frequencies.cosine.count * MemoryLayout<Float>.stride),
             shape: [1, tokenCount as NSNumber, 128, 1],
             dataType: .float32
-        )
-        let sine = self.graph.constant(
+        ))
+        let sine = self.toActivationType(self.graph.constant(
             Data(bytes: frequencies.sine, count: frequencies.sine.count * MemoryLayout<Float>.stride),
             shape: [1, tokenCount as NSNumber, 128, 1],
             dataType: .float32
-        )
+        ))
         let rotatedReal = self.graph.subtraction(
             self.graph.multiplication(real, cosine, name: nil),
             self.graph.multiplication(imaginary, sine, name: nil),
@@ -710,11 +722,11 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
     private func currentPositionEmbedding() -> MPSGraphTensor
     {
         let values = Self.sinePositionEmbedding(channels: 256)
-        return self.graph.constant(
+        return self.toActivationType(self.graph.constant(
             Data(bytes: values, count: values.count * MemoryLayout<Float>.stride),
             shape: [1, 1024, 256],
             dataType: .float32
-        )
+        ))
     }
 
     private static func sinePositionEmbedding(channels: Int) -> [Float]
@@ -744,10 +756,12 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
 
     private func linear(_ input: MPSGraphTensor, prefix: String) throws -> MPSGraphTensor
     {
-        let weight = try self.weights.constant(self.graph, named: "\(prefix).weight")
+        let layerType = self.precision.layerDataType
+        let weight = try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: layerType)
         let transposed = self.graph.transpose(weight, permutation: [1, 0], name: nil)
-        let product = self.graph.matrixMultiplication(primary: input, secondary: transposed, name: nil)
-        return self.graph.addition(product, try self.weights.constant(self.graph, named: "\(prefix).bias"), name: nil)
+        let product = self.graph.matrixMultiplication(primary: self.toLayerType(input), secondary: transposed, name: nil)
+        let biased = self.graph.addition(product, try self.weights.constant(self.graph, named: "\(prefix).bias", dataType: layerType), name: nil)
+        return self.toActivationType(biased)
     }
 
     private func layerNorm(_ input: MPSGraphTensor, prefix: String) throws -> MPSGraphTensor
@@ -758,8 +772,8 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
             input,
             mean: mean,
             variance: variance,
-            gamma: try self.weights.constant(self.graph, named: "\(prefix).weight"),
-            beta: try self.weights.constant(self.graph, named: "\(prefix).bias"),
+            gamma: try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: self.precision.activationDataType),
+            beta: try self.weights.constant(self.graph, named: "\(prefix).bias", dataType: self.precision.activationDataType),
             epsilon: 1e-5,
             name: nil
         )
@@ -767,6 +781,18 @@ private struct EfficientTAMMemoryAttentionGraphBuilder
 
     private func scalar(_ value: Float) -> MPSGraphTensor
     {
-        self.graph.constant(Double(value), dataType: .float32)
+        self.graph.constant(Double(value), dataType: self.precision.activationDataType)
+    }
+
+    private func toActivationType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let activationType = self.precision.activationDataType
+        return tensor.dataType == activationType ? tensor : self.graph.cast(tensor, to: activationType, name: nil)
+    }
+
+    private func toLayerType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let layerType = self.precision.layerDataType
+        return tensor.dataType == layerType ? tensor : self.graph.cast(tensor, to: layerType, name: nil)
     }
 }

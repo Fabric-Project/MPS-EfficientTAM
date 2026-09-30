@@ -48,7 +48,8 @@ public final class EfficientTAMMaskPostprocessor
         outputWidth: Int,
         outputHeight: Int,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard maskCount > 0, outputWidth > 0, outputHeight > 0 else
@@ -88,7 +89,7 @@ public final class EfficientTAMMaskPostprocessor
         let device = MPSGraphDevice(mtlDevice: commandQueue.device)
         let inputType = MPSGraphShapedType(shape: input.shape ?? [], dataType: .float32)
         let descriptor = MPSGraphCompilationDescriptor()
-        descriptor.optimizationLevel = .level1
+        descriptor.optimizationLevel = computeUnits.optimizationLevel
         descriptor.waitForCompilationCompletion = true
         self.executable = self.graph.compile(
             with: device,

@@ -43,7 +43,9 @@ public final class EfficientTAMImageEncoder
 
     public convenience init(
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard let binaryURL = Bundle.module.url(
@@ -62,7 +64,9 @@ public final class EfficientTAMImageEncoder
             weightsBinaryURL: binaryURL,
             weightsManifestURL: manifestURL,
             commandQueue: commandQueue,
-            maxFramesInFlight: maxFramesInFlight
+            maxFramesInFlight: maxFramesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
     }
 
@@ -70,7 +74,9 @@ public final class EfficientTAMImageEncoder
         weightsBinaryURL: URL,
         weightsManifestURL: URL,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard maxFramesInFlight > 0 else
@@ -83,7 +89,7 @@ public final class EfficientTAMImageEncoder
         self.outputCaches = (0..<maxFramesInFlight).map { _ in OutputCache() }
 
         let weights = try EfficientTAMWeights(binaryURL: weightsBinaryURL, manifestURL: weightsManifestURL)
-        let builder = EfficientTAMImageEncoderGraphBuilder(graph: self.graph, weights: weights)
+        let builder = EfficientTAMImageEncoderGraphBuilder(graph: self.graph, weights: weights, precision: precision)
         let input = self.graph.placeholder(
             shape: [1, Self.inputHeight as NSNumber, Self.inputWidth as NSNumber, 3],
             dataType: .float32,
@@ -95,7 +101,7 @@ public final class EfficientTAMImageEncoder
         let device = MPSGraphDevice(mtlDevice: commandQueue.device)
         let inputType = MPSGraphShapedType(shape: input.shape ?? [], dataType: .float32)
         let descriptor = MPSGraphCompilationDescriptor()
-        descriptor.optimizationLevel = .level1
+        descriptor.optimizationLevel = computeUnits.optimizationLevel
         descriptor.waitForCompilationCompletion = true
         // Keep the default full-precision transformer intermediates. In
         // particular, do not opt into `allowFP16Intermediates`: upstream has
@@ -287,6 +293,7 @@ private struct EfficientTAMImageEncoderGraphBuilder
 {
     let graph: MPSGraph
     let weights: EfficientTAMWeights
+    let precision: EfficientTAMPrecision
 
     private let grid = 32
     private let embedDimension = 192
@@ -296,7 +303,7 @@ private struct EfficientTAMImageEncoderGraphBuilder
 
     func build(inputNHWC: MPSGraphTensor) throws -> MPSGraphTensor
     {
-        var input = self.graph.transpose(inputNHWC, permutation: [0, 3, 1, 2], name: "input_nchw")
+        var input = self.toActivationType(self.graph.transpose(inputNHWC, permutation: [0, 3, 1, 2], name: "input_nchw"))
         input = self.graph.division(
             self.graph.subtraction(input, self.channelConstant([0.485, 0.456, 0.406]), name: nil),
             self.channelConstant([0.229, 0.224, 0.225]),
@@ -322,9 +329,9 @@ private struct EfficientTAMImageEncoderGraphBuilder
         feature = try self.layerNorm2D(feature, prefix: "image_encoder.neck.convs.0.norm_0")
         feature = try self.convolution(feature, weight: "image_encoder.neck.convs.0.conv_3x3.weight", padding: 1)
         feature = try self.layerNorm2D(feature, prefix: "image_encoder.neck.convs.0.norm_1")
-        let noMemoryEmbedding = try self.weights.constant(self.graph, named: "no_mem_embed")
+        let noMemoryEmbedding = try self.weights.constant(self.graph, named: "no_mem_embed", dataType: self.precision.activationDataType)
         let broadcastNoMemory = self.graph.reshape(noMemoryEmbedding, shape: [1, 256, 1, 1], name: nil)
-        return self.graph.addition(feature, broadcastNoMemory, name: "image_embedding")
+        return self.toFloat32(self.graph.addition(feature, broadcastNoMemory, name: nil), name: "image_embedding")
     }
 
     private func transformerBlock(
@@ -396,7 +403,8 @@ private struct EfficientTAMImageEncoderGraphBuilder
             key: key,
             value: value,
             mask: nil,
-            scale: 1 / sqrt(Float(headDimension))
+            scale: 1 / sqrt(Float(headDimension)),
+            precision: self.precision
         )
         attended = self.graph.transpose(attended, permutation: [0, 2, 1, 3], name: nil)
         attended = self.graph.reshape(
@@ -417,15 +425,20 @@ private struct EfficientTAMImageEncoderGraphBuilder
             constantValue: 0,
             name: nil
         )
-        var windows = self.graph.reshape(padded, shape: [1, 3, 14, 3, 14, 192], name: nil)
-        windows = self.graph.transpose(windows, permutation: [0, 1, 3, 2, 4, 5], name: nil)
+        // Rank 5, not [1, 3, 14, 3, 14, 192]: MPSGraph aborts building a
+        // float16 rank-6 transpose (`bad_optional_access`, macOS 15.7). The
+        // dropped leading axis is the batch of one, so the data moves
+        // identically.
+        var windows = self.graph.reshape(padded, shape: [3, 14, 3, 14, 192], name: nil)
+        windows = self.graph.transpose(windows, permutation: [0, 2, 1, 3, 4], name: nil)
         return self.graph.reshape(windows, shape: [9, 14, 14, 192], name: nil)
     }
 
     private func unpartitionWindows(_ input: MPSGraphTensor) -> MPSGraphTensor
     {
-        var tokens = self.graph.reshape(input, shape: [1, 3, 3, 14, 14, 192], name: nil)
-        tokens = self.graph.transpose(tokens, permutation: [0, 1, 3, 2, 4, 5], name: nil)
+        // Rank 5 for the same reason as `partitionWindows`.
+        var tokens = self.graph.reshape(input, shape: [3, 3, 14, 14, 192], name: nil)
+        tokens = self.graph.transpose(tokens, permutation: [0, 2, 1, 3, 4], name: nil)
         tokens = self.graph.reshape(tokens, shape: [1, 42, 42, 192], name: nil)
         return self.graph.sliceTensor(
             tokens,
@@ -438,10 +451,12 @@ private struct EfficientTAMImageEncoderGraphBuilder
 
     private func linear(_ input: MPSGraphTensor, prefix: String) throws -> MPSGraphTensor
     {
-        let weight = try self.weights.constant(self.graph, named: "\(prefix).weight")
+        let layerType = self.precision.layerDataType
+        let weight = try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: layerType)
         let transposedWeight = self.graph.transpose(weight, permutation: [1, 0], name: nil)
-        let product = self.graph.matrixMultiplication(primary: input, secondary: transposedWeight, name: nil)
-        return self.graph.addition(product, try self.weights.constant(self.graph, named: "\(prefix).bias"), name: nil)
+        let product = self.graph.matrixMultiplication(primary: self.toLayerType(input), secondary: transposedWeight, name: nil)
+        let biased = self.graph.addition(product, try self.weights.constant(self.graph, named: "\(prefix).bias", dataType: layerType), name: nil)
+        return self.toActivationType(biased)
     }
 
     private func layerNorm(_ input: MPSGraphTensor, prefix: String) throws -> MPSGraphTensor
@@ -452,8 +467,8 @@ private struct EfficientTAMImageEncoderGraphBuilder
             input,
             mean: mean,
             variance: variance,
-            gamma: try self.weights.constant(self.graph, named: "\(prefix).weight"),
-            beta: try self.weights.constant(self.graph, named: "\(prefix).bias"),
+            gamma: try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: self.precision.activationDataType),
+            beta: try self.weights.constant(self.graph, named: "\(prefix).bias", dataType: self.precision.activationDataType),
             epsilon: 1e-6,
             name: nil
         )
@@ -512,11 +527,12 @@ private struct EfficientTAMImageEncoderGraphBuilder
             throw EfficientTAMError("Could not create convolution descriptor for '\(weightName)'.")
         }
         var output = self.graph.convolution2D(
-            input,
-            weights: try self.weights.constant(self.graph, named: weightName),
+            self.toLayerType(input),
+            weights: try self.weights.constant(self.graph, named: weightName, dataType: self.precision.layerDataType),
             descriptor: descriptor,
             name: weightName
         )
+        output = self.toActivationType(output)
         if let biasName
         {
             output = self.graph.addition(
@@ -540,11 +556,11 @@ private struct EfficientTAMImageEncoderGraphBuilder
             destinationHeight: self.grid,
             destinationWidth: self.grid
         )
-        return self.graph.constant(
+        return self.toActivationType(self.graph.constant(
             Data(bytes: resized, count: resized.count * MemoryLayout<Float>.stride),
             shape: [1, self.grid as NSNumber, self.grid as NSNumber, self.embedDimension as NSNumber],
             dataType: .float32
-        )
+        ))
     }
 
     private static func bilinearResize(
@@ -585,17 +601,39 @@ private struct EfficientTAMImageEncoderGraphBuilder
         return output
     }
 
+    /// Built as float32 and cast (folded at compile time) to the activation
+    /// type.
     private func channelConstant(_ values: [Float]) -> MPSGraphTensor
     {
-        self.graph.constant(
+        self.toActivationType(self.graph.constant(
             Data(bytes: values, count: values.count * MemoryLayout<Float>.stride),
             shape: [1, values.count as NSNumber, 1, 1],
             dataType: .float32
-        )
+        ))
     }
 
     private func scalar(_ value: Float) -> MPSGraphTensor
     {
-        self.graph.constant(Double(value), dataType: .float32)
+        self.graph.constant(Double(value), dataType: self.precision.activationDataType)
+    }
+
+    private func toActivationType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let activationType = self.precision.activationDataType
+        return tensor.dataType == activationType ? tensor : self.graph.cast(tensor, to: activationType, name: nil)
+    }
+
+    private func toLayerType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let layerType = self.precision.layerDataType
+        return tensor.dataType == layerType ? tensor : self.graph.cast(tensor, to: layerType, name: nil)
+    }
+
+    /// `name` goes on the returned tensor in every precision.
+    private func toFloat32(_ tensor: MPSGraphTensor, name: String) -> MPSGraphTensor
+    {
+        tensor.dataType == .float32
+            ? self.graph.identity(with: tensor, name: name)
+            : self.graph.cast(tensor, to: .float32, name: name)
     }
 }

@@ -11,10 +11,12 @@ import Testing
     {
         return
     }
+    let precision = efficientTAMTestPrecision()
     let decoder = try EfficientTAMPromptDecoder(
         promptCount: 2,
         commandQueue: commandQueue,
-        maxFramesInFlight: 1
+        maxFramesInFlight: 1,
+        precision: precision
     )
     let embedding = try fixture(named: "encoder_reference")
     guard let embeddingBuffer = device.makeBuffer(
@@ -47,14 +49,35 @@ import Testing
         .map { abs($0 - $1) }
         .max() ?? .infinity
     print(
-        "Decoder mask MAE=\(maskMeanAbsoluteError), mask max=\(maskMaximumAbsoluteError), "
+        "Decoder \(precision) vs PyTorch: mask MAE=\(maskMeanAbsoluteError), mask max=\(maskMaximumAbsoluteError), "
             + "IoU max=\(iouMaximumAbsoluteError)"
     )
-    #expect(maskMeanAbsoluteError < 0.002)
-    #expect(maskMaximumAbsoluteError < 0.03)
-    #expect(iouMaximumAbsoluteError < 0.001)
-    #expect(objectScoreError < 0.001)
-    #expect(objectPointerMaximumAbsoluteError < 0.001)
+    if precision == .float32
+    {
+        #expect(maskMeanAbsoluteError < 0.002)
+        #expect(maskMaximumAbsoluteError < 0.03)
+        #expect(iouMaximumAbsoluteError < 0.001)
+        #expect(objectScoreError < 0.001)
+        #expect(objectPointerMaximumAbsoluteError < 0.001)
+    }
+    else
+    {
+        // Reduced tiers against the float32 decoder on the same inputs: 40 dB
+        // for masks and object pointers; absolute error for the single values.
+        let float32Prediction = try EfficientTAMPromptDecoder(promptCount: 2, commandQueue: commandQueue, maxFramesInFlight: 1)
+            .run(imageEmbeddingBuffer: embeddingBuffer, prompts: prompts)
+        let maskPSNR = efficientTAMPSNR(prediction.maskLogits, float32Prediction.maskLogits)
+        let pointerPSNR = efficientTAMPSNR(prediction.objectPointers, float32Prediction.objectPointers)
+        let iouError = zip(prediction.iouPredictions, float32Prediction.iouPredictions).map { abs($0 - $1) }.max() ?? .infinity
+        let scoreError = abs(prediction.objectScoreLogit - float32Prediction.objectScoreLogit)
+        let nonFiniteCount = (prediction.maskLogits + prediction.objectPointers + prediction.iouPredictions).filter { !$0.isFinite }.count
+        print("Decoder \(precision) vs float32: masks \(maskPSNR.formatted(.number.precision(.fractionLength(1)))) dB, object pointers \(pointerPSNR.formatted(.number.precision(.fractionLength(1)))) dB, IoU max \(iouError), object score \(scoreError), \(nonFiniteCount) non-finite")
+        #expect(nonFiniteCount == 0)
+        #expect(maskPSNR > 40)
+        #expect(pointerPSNR > 40)
+        #expect(iouError < 0.01)
+        #expect(scoreError < 0.05)
+    }
 }
 
 @Test func rejectsWrongPromptCount() throws

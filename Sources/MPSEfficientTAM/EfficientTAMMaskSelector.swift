@@ -34,7 +34,7 @@ public final class EfficientTAMMaskSelector
         var pointer = [Float](repeating: 0, count: 256)
     }
 
-    public init(commandQueue: MTLCommandQueue, maxFramesInFlight: Int = 3) throws
+    public init(commandQueue: MTLCommandQueue, maxFramesInFlight: Int = 3, computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine) throws
     {
         guard maxFramesInFlight > 0 else
         {
@@ -83,7 +83,7 @@ public final class EfficientTAMMaskSelector
         let device = MPSGraphDevice(mtlDevice: commandQueue.device)
         let inputTypes = self.inputTensors.map { MPSGraphShapedType(shape: $0.shape ?? [], dataType: .float32) }
         let descriptor = MPSGraphCompilationDescriptor()
-        descriptor.optimizationLevel = .level1
+        descriptor.optimizationLevel = computeUnits.optimizationLevel
         descriptor.waitForCompilationCompletion = true
         self.executable = self.graph.compile(
             with: device,

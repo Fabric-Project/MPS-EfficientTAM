@@ -89,7 +89,9 @@ public final class EfficientTAMVideoTracker
     public init(
         initialPromptCount: Int = 2,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard maxFramesInFlight > 0 else
@@ -104,7 +106,7 @@ public final class EfficientTAMVideoTracker
         // `EfficientTAMSharedStages.framesInFlight` allows.
         self.submissionSlots = EfficientTAMSlotPool(count: maxFramesInFlight)
 
-        let stages = try EfficientTAMSharedStages.stages(commandQueue: commandQueue)
+        let stages = try EfficientTAMSharedStages.stages(commandQueue: commandQueue, precision: precision, computeUnits: computeUnits)
         self.stages = stages
         self.imageEncoder = stages.imageEncoder
         self.trackingDecoder = stages.promptDecoder
@@ -119,7 +121,9 @@ public final class EfficientTAMVideoTracker
             self.initialDecoder = try EfficientTAMPromptDecoder(
                 promptCount: initialPromptCount,
                 commandQueue: commandQueue,
-                maxFramesInFlight: maxFramesInFlight * 2
+                maxFramesInFlight: maxFramesInFlight * 2,
+                precision: precision,
+                computeUnits: computeUnits
             )
         }
         let trackingPrompts = try self.trackingDecoder.makePromptBuffers([

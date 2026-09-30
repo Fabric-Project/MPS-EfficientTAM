@@ -25,7 +25,8 @@ import Testing
     {
         return
     }
-    let encoder = try EfficientTAMImageEncoder(commandQueue: commandQueue, maxFramesInFlight: 1)
+    let precision = efficientTAMTestPrecision()
+    let encoder = try EfficientTAMImageEncoder(commandQueue: commandQueue, maxFramesInFlight: 1, precision: precision)
     let count = EfficientTAMImageEncoder.inputWidth * EfficientTAMImageEncoder.inputHeight * 3
     let rgb = (0..<count).map { Float($0 % 251) / 250 }
     guard let inputBuffer = device.makeBuffer(
@@ -49,8 +50,15 @@ import Testing
     let absoluteErrors = zip(actual, reference).map { abs($0 - $1) }
     let meanAbsoluteError = absoluteErrors.reduce(0, +) / Float(absoluteErrors.count)
     let maximumAbsoluteError = absoluteErrors.max() ?? .infinity
-    #expect(meanAbsoluteError < 0.0005)
-    #expect(maximumAbsoluteError < 0.01)
+    print("EfficientTAM image encoder \(precision) vs PyTorch: MAE \(meanAbsoluteError), max \(maximumAbsoluteError), \(efficientTAMPSNR(actual, reference)) dB")
+    // The reduced tiers are judged on a real frame by
+    // imageEncoderPrecisionMatchesFloat32OnRealFrame; against this synthetic
+    // pattern they are only reported.
+    if precision == .float32
+    {
+        #expect(meanAbsoluteError < 0.0005)
+        #expect(maximumAbsoluteError < 0.01)
+    }
 }
 
 @Test func encodeProducesReadableGPUOutputWithoutAnInterveningCPUWait() throws

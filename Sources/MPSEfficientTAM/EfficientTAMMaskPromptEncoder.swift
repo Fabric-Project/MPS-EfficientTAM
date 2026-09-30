@@ -42,7 +42,12 @@ public final class EfficientTAMMaskPromptEncoder
         )
     }
 
-    public convenience init(commandQueue: MTLCommandQueue, maxFramesInFlight: Int = 3) throws
+    public convenience init(
+        commandQueue: MTLCommandQueue,
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
+    ) throws
     {
         guard let binaryURL = Bundle.module.url(
             forResource: "EfficientTAMTiny512_weights",
@@ -60,7 +65,9 @@ public final class EfficientTAMMaskPromptEncoder
             weightsBinaryURL: binaryURL,
             weightsManifestURL: manifestURL,
             commandQueue: commandQueue,
-            maxFramesInFlight: maxFramesInFlight
+            maxFramesInFlight: maxFramesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
     }
 
@@ -68,7 +75,9 @@ public final class EfficientTAMMaskPromptEncoder
         weightsBinaryURL: URL,
         weightsManifestURL: URL,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard maxFramesInFlight > 0 else
@@ -80,7 +89,7 @@ public final class EfficientTAMMaskPromptEncoder
         self.outputCaches = (0..<maxFramesInFlight).map { _ in OutputCache() }
 
         let weights = try EfficientTAMWeights(binaryURL: weightsBinaryURL, manifestURL: weightsManifestURL)
-        let builder = EfficientTAMMaskPromptGraphBuilder(graph: self.graph, weights: weights)
+        let builder = EfficientTAMMaskPromptGraphBuilder(graph: self.graph, weights: weights, precision: precision)
         let input = self.graph.placeholder(shape: [1, 1, 128, 128], dataType: .float32, name: "mask_logits")
         self.inputTensor = input
         self.outputTensor = try builder.build(input)
@@ -88,7 +97,7 @@ public final class EfficientTAMMaskPromptEncoder
         let device = MPSGraphDevice(mtlDevice: commandQueue.device)
         let inputType = MPSGraphShapedType(shape: input.shape ?? [], dataType: .float32)
         let descriptor = MPSGraphCompilationDescriptor()
-        descriptor.optimizationLevel = .level1
+        descriptor.optimizationLevel = computeUnits.optimizationLevel
         descriptor.waitForCompilationCompletion = true
         self.executable = self.graph.compile(
             with: device,
@@ -232,16 +241,17 @@ private struct EfficientTAMMaskPromptGraphBuilder
 {
     let graph: MPSGraph
     let weights: EfficientTAMWeights
+    let precision: EfficientTAMPrecision
 
     func build(_ input: MPSGraphTensor) throws -> MPSGraphTensor
     {
-        var output = try self.convolution(input, prefix: "sam_prompt_encoder.mask_downscaling.0", stride: 2)
+        var output = try self.convolution(self.toActivationType(input), prefix: "sam_prompt_encoder.mask_downscaling.0", stride: 2)
         output = try self.layerNorm2D(output, prefix: "sam_prompt_encoder.mask_downscaling.1")
         output = self.gelu(output)
         output = try self.convolution(output, prefix: "sam_prompt_encoder.mask_downscaling.3", stride: 2)
         output = try self.layerNorm2D(output, prefix: "sam_prompt_encoder.mask_downscaling.4")
         output = self.gelu(output)
-        return try self.convolution(output, prefix: "sam_prompt_encoder.mask_downscaling.6", stride: 1)
+        return self.toFloat32(try self.convolution(output, prefix: "sam_prompt_encoder.mask_downscaling.6", stride: 1))
     }
 
     private func convolution(_ input: MPSGraphTensor, prefix: String, stride: Int) throws -> MPSGraphTensor
@@ -264,13 +274,13 @@ private struct EfficientTAMMaskPromptGraphBuilder
             throw EfficientTAMError("Could not create the EfficientTAM mask-prompt convolution descriptor.")
         }
         var output = self.graph.convolution2D(
-            input,
-            weights: try self.weights.constant(self.graph, named: "\(prefix).weight"),
+            self.toLayerType(input),
+            weights: try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: self.precision.layerDataType),
             descriptor: descriptor,
             name: prefix
         )
         let bias = try self.weights.floats(named: "\(prefix).bias")
-        output = self.graph.addition(output, self.channelConstant(bias), name: nil)
+        output = self.graph.addition(self.toActivationType(output), self.channelConstant(bias), name: nil)
         return output
     }
 
@@ -291,10 +301,11 @@ private struct EfficientTAMMaskPromptGraphBuilder
 
     private func gelu(_ input: MPSGraphTensor) -> MPSGraphTensor
     {
-        let inverseSquareRootTwo = self.graph.constant(1 / sqrt(2), dataType: .float32)
+        let activationType = self.precision.activationDataType
+        let inverseSquareRootTwo = self.graph.constant(1 / sqrt(2), dataType: activationType)
         let erf = self.graph.erf(with: self.graph.multiplication(input, inverseSquareRootTwo, name: nil), name: nil)
-        let half = self.graph.constant(0.5, dataType: .float32)
-        let one = self.graph.constant(1, dataType: .float32)
+        let half = self.graph.constant(0.5, dataType: activationType)
+        let one = self.graph.constant(1, dataType: activationType)
         return self.graph.multiplication(
             self.graph.multiplication(input, half, name: nil),
             self.graph.addition(one, erf, name: nil),
@@ -302,12 +313,31 @@ private struct EfficientTAMMaskPromptGraphBuilder
         )
     }
 
+    /// Built as float32 and cast (folded at compile time) to the activation
+    /// type.
     private func channelConstant(_ values: [Float]) -> MPSGraphTensor
     {
-        self.graph.constant(
+        self.toActivationType(self.graph.constant(
             Data(bytes: values, count: values.count * MemoryLayout<Float>.stride),
             shape: [1, values.count as NSNumber, 1, 1],
             dataType: .float32
-        )
+        ))
+    }
+
+    private func toActivationType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let activationType = self.precision.activationDataType
+        return tensor.dataType == activationType ? tensor : self.graph.cast(tensor, to: activationType, name: nil)
+    }
+
+    private func toLayerType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let layerType = self.precision.layerDataType
+        return tensor.dataType == layerType ? tensor : self.graph.cast(tensor, to: layerType, name: nil)
+    }
+
+    private func toFloat32(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        tensor.dataType == .float32 ? tensor : self.graph.cast(tensor, to: .float32, name: nil)
     }
 }

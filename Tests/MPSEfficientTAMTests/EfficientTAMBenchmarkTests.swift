@@ -8,7 +8,8 @@ import Testing
 private let benchmarkEnabled = ProcessInfo.processInfo.environment["EFFICIENTTAM_BENCHMARK"] != nil
 
 /// Opt-in: `EFFICIENTTAM_BENCHMARK=1 swift test -c release --filter trackerBenchmark`.
-/// Prints numbers only and asserts nothing about speed.
+/// Prints numbers only and asserts nothing about speed. `EFFICIENTTAM_PRECISION`
+/// picks the tier (float32 by default).
 @Test(.enabled(if: benchmarkEnabled))
 func trackerBenchmark() throws
 {
@@ -22,7 +23,8 @@ func trackerBenchmark() throws
         .init(x: 160, y: 300, label: .positivePoint),
         .init(x: 0, y: 0, label: .padding),
     ]
-    print("Benchmark device: \(device.name); footprint before any tracker: \(Int(physicalFootprintMB())) MB")
+    let precision = efficientTAMTestPrecision()
+    print("Benchmark device: \(device.name); precision \(precision); footprint before any tracker: \(Int(physicalFootprintMB())) MB")
 
     // (frames in flight, command-queue command-buffer cap; 0 = the default queue)
     for (maxFramesInFlight, commandBufferCap) in [(1, 0), (2, 0), (3, 0), (3, 1024)]
@@ -34,7 +36,7 @@ func trackerBenchmark() throws
         let cpu = StageTimings()
         do
         {
-            let tracker = try EfficientTAMVideoTracker(commandQueue: commandQueue, maxFramesInFlight: maxFramesInFlight)
+            let tracker = try EfficientTAMVideoTracker(commandQueue: commandQueue, maxFramesInFlight: maxFramesInFlight, precision: precision)
             tracker.cpuTimingHandler = { _, stage, milliseconds in cpu.add(stage, milliseconds) }
             try tracker.prewarmMemoryAttention()
 

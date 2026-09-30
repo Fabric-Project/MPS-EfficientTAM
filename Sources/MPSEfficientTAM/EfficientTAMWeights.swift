@@ -53,6 +53,15 @@ final class EfficientTAMWeights
         )
     }
 
+    /// The named tensor in `dataType`: the float32 constant, cast in the graph
+    /// when another type is asked for. MPSGraph folds the cast at compile
+    /// time, so the executable holds the weight only in `dataType`.
+    func constant(_ graph: MPSGraph, named name: String, dataType: MPSDataType) throws -> MPSGraphTensor
+    {
+        let constant = try self.constant(graph, named: name)
+        return dataType == .float32 ? constant : graph.cast(constant, to: dataType, name: nil)
+    }
+
     /// The named float32 tensor's byte range within the mapped file.
     private func byteRange(named name: String) throws -> Range<Data.Index>
     {

@@ -135,7 +135,9 @@ public final class EfficientTAMPromptDecoder
     public convenience init(
         promptCount: Int = 2,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard let binaryURL = Bundle.module.url(
@@ -155,7 +157,9 @@ public final class EfficientTAMPromptDecoder
             weightsManifestURL: manifestURL,
             promptCount: promptCount,
             commandQueue: commandQueue,
-            maxFramesInFlight: maxFramesInFlight
+            maxFramesInFlight: maxFramesInFlight,
+            precision: precision,
+            computeUnits: computeUnits
         )
     }
 
@@ -164,7 +168,9 @@ public final class EfficientTAMPromptDecoder
         weightsManifestURL: URL,
         promptCount: Int,
         commandQueue: MTLCommandQueue,
-        maxFramesInFlight: Int = 3
+        maxFramesInFlight: Int = 3,
+        precision: EfficientTAMPrecision = .float32,
+        computeUnits: EfficientTAMComputeUnits = .gpuAndNeuralEngine
     ) throws
     {
         guard promptCount > 0 else
@@ -215,7 +221,8 @@ public final class EfficientTAMPromptDecoder
         let builder = EfficientTAMPromptDecoderGraphBuilder(
             graph: self.graph,
             weights: weights,
-            promptCount: promptCount
+            promptCount: promptCount,
+            precision: precision
         )
         let imageEmbedding = self.graph.placeholder(
             shape: [1, 256, 32, 32],
@@ -258,7 +265,7 @@ public final class EfficientTAMPromptDecoder
         let labelsType = MPSGraphShapedType(shape: promptLabels.shape ?? [], dataType: .float32)
         let densePromptType = MPSGraphShapedType(shape: densePromptEmbedding.shape ?? [], dataType: .float32)
         let descriptor = MPSGraphCompilationDescriptor()
-        descriptor.optimizationLevel = .level1
+        descriptor.optimizationLevel = computeUnits.optimizationLevel
         descriptor.waitForCompilationCompletion = true
         self.executable = self.graph.compile(
             with: device,
@@ -612,6 +619,7 @@ private struct EfficientTAMPromptDecoderGraphBuilder
     let graph: MPSGraph
     let weights: EfficientTAMWeights
     let promptCount: Int
+    let precision: EfficientTAMPrecision
 
     func build(
         imageEmbedding: MPSGraphTensor,
@@ -626,14 +634,14 @@ private struct EfficientTAMPromptDecoderGraphBuilder
     )
     {
         let sparsePrompts = try self.promptEmbeddings(
-            coordinates: promptCoordinates,
-            labels: promptLabels
+            coordinates: self.toActivationType(promptCoordinates),
+            labels: self.toActivationType(promptLabels)
         )
         let outputTokens = try self.outputTokens()
         let queryPosition = self.graph.concatTensors([outputTokens, sparsePrompts], dimension: 1, name: nil)
         var queries = queryPosition
 
-        var image = self.graph.addition(imageEmbedding, densePromptEmbedding, name: nil)
+        var image = self.graph.addition(self.toActivationType(imageEmbedding), self.toActivationType(densePromptEmbedding), name: nil)
         image = self.graph.reshape(image, shape: [1, 256, 1024], name: nil)
         var keys = self.graph.transpose(image, permutation: [0, 2, 1], name: nil)
         let imagePosition = try self.densePositionEmbedding()
@@ -760,7 +768,11 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             hypernetworks.append(self.graph.reshape(token, shape: [1, 1, 32], name: nil))
         }
         let hypernetwork = self.graph.concatTensors(hypernetworks, dimension: 1, name: nil)
-        var masks = self.graph.matrixMultiplication(primary: hypernetwork, secondary: flattenedUpscaled, name: nil)
+        var masks = self.toActivationType(self.graph.matrixMultiplication(
+            primary: self.toLayerType(hypernetwork),
+            secondary: self.toLayerType(flattenedUpscaled),
+            name: nil
+        ))
         masks = self.graph.reshape(masks, shape: [1, 4, 128, 128], name: nil)
         masks = self.graph.sliceTensor(masks, dimension: 1, start: 1, length: 3, name: "mask_logits")
 
@@ -774,7 +786,7 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             }
         }
         iou = self.graph.sigmoid(with: iou, name: nil)
-        iou = self.graph.sliceTensor(iou, dimension: 1, start: 1, length: 3, name: "iou_predictions")
+        iou = self.graph.sliceTensor(iou, dimension: 1, start: 1, length: 3, name: nil)
 
         var objectScore = objectScoreToken
         for layer in 0..<3
@@ -803,16 +815,21 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             predicate: self.graph.reshape(objectPresent, shape: [1, 1, 1, 1], name: nil),
             trueTensor: masks,
             falseTensor: self.scalar(-1024),
-            name: "visible_mask_logits"
+            name: nil
         )
-        let noObjectPointer = try self.weights.constant(self.graph, named: "no_obj_ptr")
+        let noObjectPointer = try self.weights.constant(self.graph, named: "no_obj_ptr", dataType: self.precision.activationDataType)
         objectPointers = self.graph.select(
             predicate: objectPresent,
             trueTensor: objectPointers,
             falseTensor: noObjectPointer,
-            name: "object_pointers"
+            name: nil
         )
-        return (masks, iou, objectScore, objectPointers)
+        return (
+            self.toFloat32(masks, name: "visible_mask_logits"),
+            self.toFloat32(iou, name: "iou_predictions"),
+            self.toFloat32(objectScore, name: "object_score_logit"),
+            self.toFloat32(objectPointers, name: "object_pointers")
+        )
     }
 
     private func promptEmbeddings(
@@ -829,7 +846,8 @@ private struct EfficientTAMPromptDecoderGraphBuilder
         )
         let gaussian = try self.weights.constant(
             self.graph,
-            named: "sam_prompt_encoder.pe_layer.positional_encoding_gaussian_matrix"
+            named: "sam_prompt_encoder.pe_layer.positional_encoding_gaussian_matrix",
+            dataType: self.precision.activationDataType
         )
         var phases = self.graph.matrixMultiplication(primary: normalized, secondary: gaussian, name: nil)
         phases = self.graph.multiplication(phases, self.scalar(2 * .pi), name: nil)
@@ -840,7 +858,7 @@ private struct EfficientTAMPromptDecoderGraphBuilder
         )
         let predicates = self.graph.reshape(labels, shape: [1, self.promptCount as NSNumber, 1], name: nil)
         let paddingPredicate = self.graph.equal(predicates, self.scalar(-1), name: nil)
-        let notAPoint = try self.weights.constant(self.graph, named: "sam_prompt_encoder.not_a_point_embed.weight")
+        let notAPoint = try self.weights.constant(self.graph, named: "sam_prompt_encoder.not_a_point_embed.weight", dataType: self.precision.activationDataType)
         embedding = self.graph.select(
             predicate: paddingPredicate,
             trueTensor: notAPoint,
@@ -852,7 +870,8 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             let predicate = self.graph.equal(predicates, self.scalar(Float(label)), name: nil)
             let labelEmbedding = try self.weights.constant(
                 self.graph,
-                named: "sam_prompt_encoder.point_embeddings.\(label).weight"
+                named: "sam_prompt_encoder.point_embeddings.\(label).weight",
+                dataType: self.precision.activationDataType
             )
             embedding = self.graph.select(
                 predicate: predicate,
@@ -866,9 +885,9 @@ private struct EfficientTAMPromptDecoderGraphBuilder
 
     private func outputTokens() throws -> MPSGraphTensor
     {
-        let object = try self.weights.constant(self.graph, named: "sam_mask_decoder.obj_score_token.weight")
-        let iou = try self.weights.constant(self.graph, named: "sam_mask_decoder.iou_token.weight")
-        let masks = try self.weights.constant(self.graph, named: "sam_mask_decoder.mask_tokens.weight")
+        let object = try self.weights.constant(self.graph, named: "sam_mask_decoder.obj_score_token.weight", dataType: self.precision.activationDataType)
+        let iou = try self.weights.constant(self.graph, named: "sam_mask_decoder.iou_token.weight", dataType: self.precision.activationDataType)
+        let masks = try self.weights.constant(self.graph, named: "sam_mask_decoder.mask_tokens.weight", dataType: self.precision.activationDataType)
         let combined = self.graph.concatTensors([object, iou, masks], dimension: 0, name: nil)
         return self.graph.reshape(combined, shape: [1, 6, 256], name: nil)
     }
@@ -918,7 +937,8 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             key: projectedKey,
             value: projectedValue,
             mask: nil,
-            scale: 1 / sqrt(Float(headDimension))
+            scale: 1 / sqrt(Float(headDimension)),
+            precision: self.precision
         )
         output = self.graph.transpose(output, permutation: [0, 2, 1, 3], name: nil)
         output = self.graph.reshape(output, shape: [1, queryCount as NSNumber, internalDimension as NSNumber], name: nil)
@@ -927,10 +947,12 @@ private struct EfficientTAMPromptDecoderGraphBuilder
 
     private func linear(_ input: MPSGraphTensor, prefix: String) throws -> MPSGraphTensor
     {
-        let weight = try self.weights.constant(self.graph, named: "\(prefix).weight")
+        let layerType = self.precision.layerDataType
+        let weight = try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: layerType)
         let transposedWeight = self.graph.transpose(weight, permutation: [1, 0], name: nil)
-        let product = self.graph.matrixMultiplication(primary: input, secondary: transposedWeight, name: nil)
-        return self.graph.addition(product, try self.weights.constant(self.graph, named: "\(prefix).bias"), name: nil)
+        let product = self.graph.matrixMultiplication(primary: self.toLayerType(input), secondary: transposedWeight, name: nil)
+        let biased = self.graph.addition(product, try self.weights.constant(self.graph, named: "\(prefix).bias", dataType: layerType), name: nil)
+        return self.toActivationType(biased)
     }
 
     private func layerNorm(_ input: MPSGraphTensor, prefix: String) throws -> MPSGraphTensor
@@ -941,8 +963,8 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             input,
             mean: mean,
             variance: variance,
-            gamma: try self.weights.constant(self.graph, named: "\(prefix).weight"),
-            beta: try self.weights.constant(self.graph, named: "\(prefix).bias"),
+            gamma: try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: self.precision.activationDataType),
+            beta: try self.weights.constant(self.graph, named: "\(prefix).bias", dataType: self.precision.activationDataType),
             epsilon: 1e-5,
             name: nil
         )
@@ -988,13 +1010,13 @@ private struct EfficientTAMPromptDecoderGraphBuilder
             throw EfficientTAMError("Could not create EfficientTAM transpose-convolution descriptor.")
         }
         var output = self.graph.convolutionTranspose2D(
-            input,
-            weights: try self.weights.constant(self.graph, named: "\(prefix).weight"),
+            self.toLayerType(input),
+            weights: try self.weights.constant(self.graph, named: "\(prefix).weight", dataType: self.precision.layerDataType),
             outputShape: [1, outputChannels as NSNumber, outputSize as NSNumber, outputSize as NSNumber],
             descriptor: descriptor,
             name: nil
         )
-        output = self.graph.addition(output, try self.channelConstant(named: "\(prefix).bias"), name: nil)
+        output = self.graph.addition(self.toActivationType(output), try self.channelConstant(named: "\(prefix).bias"), name: nil)
         return output
     }
 
@@ -1031,11 +1053,11 @@ private struct EfficientTAMPromptDecoderGraphBuilder
                 }
             }
         }
-        let nchw = self.graph.constant(
+        let nchw = self.toActivationType(self.graph.constant(
             Data(bytes: values, count: values.count * MemoryLayout<Float>.stride),
             shape: [1, 256, 32, 32],
             dataType: .float32
-        )
+        ))
         let flat = self.graph.reshape(nchw, shape: [1, 256, 1024], name: nil)
         return self.graph.transpose(flat, permutation: [0, 2, 1], name: nil)
     }
@@ -1043,15 +1065,35 @@ private struct EfficientTAMPromptDecoderGraphBuilder
     private func channelConstant(named name: String) throws -> MPSGraphTensor
     {
         let values = try self.weights.floats(named: name)
-        return self.graph.constant(
+        return self.toActivationType(self.graph.constant(
             Data(bytes: values, count: values.count * MemoryLayout<Float>.stride),
             shape: [1, values.count as NSNumber, 1, 1],
             dataType: .float32
-        )
+        ))
     }
 
     private func scalar(_ value: Float) -> MPSGraphTensor
     {
-        self.graph.constant(Double(value), dataType: .float32)
+        self.graph.constant(Double(value), dataType: self.precision.activationDataType)
+    }
+
+    private func toActivationType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let activationType = self.precision.activationDataType
+        return tensor.dataType == activationType ? tensor : self.graph.cast(tensor, to: activationType, name: nil)
+    }
+
+    private func toLayerType(_ tensor: MPSGraphTensor) -> MPSGraphTensor
+    {
+        let layerType = self.precision.layerDataType
+        return tensor.dataType == layerType ? tensor : self.graph.cast(tensor, to: layerType, name: nil)
+    }
+
+    /// `name` goes on the returned tensor in every precision.
+    private func toFloat32(_ tensor: MPSGraphTensor, name: String) -> MPSGraphTensor
+    {
+        tensor.dataType == .float32
+            ? self.graph.identity(with: tensor, name: name)
+            : self.graph.cast(tensor, to: .float32, name: name)
     }
 }
